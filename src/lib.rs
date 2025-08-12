@@ -15,9 +15,13 @@ pub mod seed;
 pub mod flat;
 pub mod kmeans;
 pub mod ivf;
+pub mod persist;
+pub mod header;
+pub mod embed;
 pub mod eval;
 
 pub use metric::Metric;
 pub use types::{Hit, stable_top_k};
 pub use flat::FlatIndex;
 pub use ivf::{IvfIndex, IvfParams};
+pub use header::{IndexHeader, Seeds};

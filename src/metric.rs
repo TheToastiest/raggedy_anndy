@@ -1,5 +1,7 @@
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric { L2, Cosine }
+
 
 #[inline]
 pub fn l2_distance(a: &[f32], b: &[f32]) -> f32 {

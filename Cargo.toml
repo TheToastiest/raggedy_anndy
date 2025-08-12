@@ -1,3 +1,5 @@
+
+## Cargo.toml
 [package]
 name = "raggedy_anndy"
 version = "0.1.0"
@@ -7,7 +9,7 @@ description = "Deterministic ANN + RAG building blocks (Flat, IVF-Flat)"
 
 [[bin]]
 name = "sweep"
-path = "src/sweep.rs"
+path = "bin/sweep.rs"
 [features]
 # Make optional deps activatable via features
 default = ["serde", "persist"]

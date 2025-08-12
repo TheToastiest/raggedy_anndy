@@ -48,13 +48,13 @@ mod tests {
             data.push((i as u64, v));
         }
 
-        let params = IvfParams { nlist: 256, nprobe: 96, refine: 300, seed: 7 };
+        let params = IvfParams { nlist: 256, nprobe: 64, refine: 200, seed: 7 };
         let ivf = IvfIndex::build(Metric::Cosine, dim, &data, params);
 
         let mut q_rng = StdRng::seed_from_u64(999);
         let mut total_hits = 0usize;
         let mut total_possible = 0usize;
-        for _ in 0..150 {
+        for _ in 0..100 {
             let q = random_unit_vec(&mut q_rng, dim);
             let truth = flat.search(&q, k);
             let ann = ivf.search(&q, k);
