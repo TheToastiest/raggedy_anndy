@@ -1,6 +1,24 @@
 [package]
 name = "raggedy_anndy"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Deterministic ANN + RAG building blocks (Flat, IVF-Flat)"
+
+[[bin]]
+name = "sweep"
+path = "src/sweep.rs"
+[features]
+# Make optional deps activatable via features
+default = ["serde", "persist"]
+serde = ["dep:serde", "dep:serde_json"]
+persist = []
 
 [dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+clap = { version = "4", features = ["derive"] }
+rand = "0.8" # only for test data generation
+
+[dev-dependencies]
+proptest = "1"
