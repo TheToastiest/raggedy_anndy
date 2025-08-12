@@ -21,7 +21,7 @@ Deterministic ANN for RAG in Rust. Flat exact search and IVF Flat with seeded k 
 Clone and build with stable Rust.
 
 ```bash
-git clone https://github.com/yourname/raggedy_anndy.git
+git clone https://github.com/TheToastiest/raggedy_anndy.git
 cd raggedy_anndy
 cargo build
 ```
