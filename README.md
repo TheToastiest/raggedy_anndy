@@ -133,7 +133,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo run --release --bin sweep -- --n 4000 --dim 32 --metric cosine --k 10 --nlist 256 --nprobe 96 --refine 200 --queries 200 --warmup 25 --target-lb 0.90 --enforce --csv results.csv
+      - run: cargo run --release --bin sweep -- --n N --dim 32 --metric cosine --k 10 --nlist 256 --nprobe 96 --refine 200 --queries 200 --warmup 25 --target-lb 0.90 --enforce --csv results.csv
       - uses: actions/upload-artifact@v4
         with:
           name: sweep-results
