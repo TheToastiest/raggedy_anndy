@@ -44,6 +44,15 @@ cargo run --release --bin sweep -- \
   --csv results.csv
 ```
 
+After building the repo, you can also run sweep with the following command series
+```
+target\release\sweep.exe --backend ivf-pq --m 64 --nbits 8 --iters 25 --store-vecs   --n 4000 --dim 512 --metric cosine --k 10   --nlist 1024 --nprobe 512 --refine 1000,1500   --queries 200 --warmup 25   --seed-data 42 --seed-queries 999 --seed-kmeans 7   --target-lb 0.90 --enforce --csv pq_768_fix.csv      
+Dataset built in 8 ms (N=4000, dim=512, metric=Cosine)
+  nprobe   refine   recall     lb95    p50(ms)    p95(ms)        QPS
+     512     1000    0.956    0.946     25.958     32.772       37.6
+     512     1500    0.961    0.952     23.569     24.788       42.3
+BEST -> backend=IvfPq nprobe=512 refine=1500 recall=0.961 lb95=0.952 p95=24.788 ms
+```
 Typical results on a laptop for cosine with N 4000 and dim 32 and k 10:
 
 * nprobe 96 refine 200 gives recall about 0.963 and lb95 about 0.954
