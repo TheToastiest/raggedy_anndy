@@ -30,6 +30,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"] }
 rand = "0.8" # only for test data generation
+nalgebra = { version = "0.32", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 proptest = "1"

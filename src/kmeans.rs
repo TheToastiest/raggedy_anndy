@@ -66,6 +66,16 @@ pub fn kmeans_seeded(
         }
         // Update
         let mut new_centers = vec![vec![0.0f32; dim]; k];
+        if metric == Metric::Cosine {
+            for c in 0..k {
+                let mut n = 0.0f32;
+                for d in 0..dim { n += new_centers[c][d] * new_centers[c][d]; }
+                if n > 0.0 {
+                    let inv = n.sqrt().recip();
+                    for d in 0..dim { new_centers[c][d] *= inv; }
+                }
+            }
+        }
         let mut counts = vec![0usize; k];
         for i in 0..n {
             let c = assign[i]; counts[c] += 1;

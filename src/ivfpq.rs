@@ -45,7 +45,7 @@ pub struct IvfPqIndex {
     pub params: IvfPqParams,
     pub centroids: Vec<Vec<f32>>, // if Cosine, unit-norm
     pub pq: ProductQuantizer,     // trained on L2 residuals (normalized if Cosine)
-    pub opq: Option<Opq>,
+    pub opq: Option<Opq>,         // trained rotation (PCA) if use_opq, else identity
     pub lists: Vec<IvfPqList>,
 }
 
@@ -115,11 +115,19 @@ impl IvfPqIndex {
             residuals.push(r);
         }
 
-        // 4) OPQ (optional, deterministic)
-        let opq = if params.use_opq { Some(Opq::identity(dim, params.m)) } else { None };
+        // 4) OPQ (PCA rotation) if requested; else identity fast-path
+        // NOTE: We train on residuals (effective L2 space).
+        // before training PQ
+        let opq = if params.use_opq {
+            // train permutation on residuals
+            Some(Opq::train_perm(dim, params.m, &residuals))
+        } else { None };
+
         let pq_train_in: Vec<Vec<f32>> = if let Some(opq_ref) = opq.as_ref() {
             residuals.iter().map(|r| opq_ref.apply(r)).collect()
-        } else { residuals.clone() };
+        } else {
+            residuals.clone()
+        };
 
         // 5) Train PQ on residuals (L2 space). Deterministic seed.
         let mut pq = ProductQuantizer::new(dim, params.m, params.nbits, params.iters.max(25), params.seed ^ 0xA5A5A5A5);
@@ -205,11 +213,9 @@ impl IvfPqIndex {
             // residual for this list
             let mut qres = vec![0.0f32; self.dim];
             for d in 0..self.dim { qres[d] = q_eff[d] - self.centroids[li][d]; }
-            let mut qres_opq = if let Some(opq_ref) = self.opq.as_ref() {
-                opq_ref.apply(&qres)
-            } else { qres };
+            let qres = if let Some(opq_ref) = self.opq.as_ref() { opq_ref.apply(&qres) } else { qres };
 
-            let lut = self.pq.adc_lut(&qres_opq);
+            let lut = self.pq.adc_lut(&qres);
 
             let list = &self.lists[li];
             for i in 0..list.len() {
@@ -262,28 +268,38 @@ impl IvfPqIndex {
         h64(&mut h, p.nlist as u64); h64(&mut h, p.nprobe as u64); h64(&mut h, p.refine as u64);
         h64(&mut h, p.seed as u64); h64(&mut h, p.m as u64); h64(&mut h, p.nbits as u64); h64(&mut h, p.iters as u64);
         h64(&mut h, p.use_opq as u64); h64(&mut h, p.store_vecs as u64);
+        // inside impl IvfPqIndex { pub fn fingerprint(&self) -> u64 { ... } }
         for c in &self.centroids { for &f in c { hf(&mut h, f); } }
         for j in 0..self.pq.m { for &f in &self.pq.codebooks[j] { hf(&mut h, f); } }
+        // + Hash OPQ transform if present (permutation or matrix)
+        
+        if let Some(opq) = &self.opq {
+            for x in opq.fingerprint_bits() { h64(&mut h, x); }
+        }
         for list in &self.lists { h64(&mut h, list.ids.len() as u64); for id in &list.ids { h64(&mut h, *id); } }
         h
     }
 
+    /// Parallel ADC gather with per-thread partial top-R, then exact refine.
+    /// Mirrors search_with_filter logic (Cosine→normalize + L2 residual + OPQ).
     pub fn search_parallel(&self, q: &[f32], k: usize, threads: usize) -> Vec<Hit> {
-        #[inline]
-        fn centroid_score(metric_t: Metric, v: &[f32], c: &[f32]) -> f32 {
-            match metric_t {
-                Metric::L2 => -crate::metric::l2_distance(v, c),
-                Metric::Cosine => crate::metric::cosine_sim(v, c),
-            }
-        }
         assert!(threads >= 1);
         assert_eq!(q.len(), self.dim);
+        let use_cosine = matches!(self.metric, Metric::Cosine);
+
+        // Effective query
+        let q_eff_vec;
+        let q_eff = if use_cosine {
+            q_eff_vec = l2_normalized(q);
+            &q_eff_vec
+        } else { q };
 
         let nprobe = self.params.nprobe.min(self.centroids.len());
         let refine_total = self.params.refine.max(k);
 
+        // Probe lists by L2 score in effective space
         let mut probe: Vec<(usize, f32)> = (0..self.centroids.len())
-            .map(|i| (i, centroid_score(self.metric, q, &self.centroids[i]))).collect();
+            .map(|i| (i, centroid_score_l2(q_eff, &self.centroids[i]))).collect();
         probe.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
         let probe: Vec<usize> = probe.into_iter().take(nprobe).map(|(i,_)| i).collect();
 
@@ -296,6 +312,8 @@ impl IvfPqIndex {
         let refine_each = ((refine_total + t - 1) / t).max(k);
 
         let mut partials: Vec<Vec<Hit>> = vec![Vec::new(); t];
+        let self_dim = self.dim;
+        let self_m = self.params.m;
 
         thread::scope(|scope| {
             let mut handles = Vec::with_capacity(t);
@@ -303,20 +321,21 @@ impl IvfPqIndex {
                 let start = ti * chunk;
                 let end = ((ti + 1) * chunk).min(probe.len());
                 let lists: Vec<usize> = probe[start..end].to_vec();
+                let q_eff_ref: &[f32] = q_eff;
 
                 handles.push(scope.spawn(move || -> (usize, Vec<Hit>) {
                     let mut local: Vec<Hit> = Vec::new();
                     for li in lists {
-                        // query residual for this list
-                        let mut qres = vec![0.0f32; self.dim];
-                        for d in 0..self.dim { qres[d] = q[d] - self.centroids[li][d]; }
-                        if let Some(opq_ref) = self.opq.as_ref() { qres = opq_ref.apply(&qres); }
-                        let lut = self.pq.adc_lut(&qres);
+                        // residual for this list
+                        let mut qres = vec![0.0f32; self_dim];
+                        for d in 0..self_dim { qres[d] = q_eff_ref[d] - self.centroids[li][d]; }
+                        let qres = if let Some(opq_ref) = self.opq.as_ref() { opq_ref.apply(&qres) } else { qres };
 
+                        let lut = self.pq.adc_lut(&qres);
                         let list = &self.lists[li];
                         for i in 0..list.len() {
                             if list.tomb[i] != 0 { continue; }
-                            let codes = list.code_row(self.params.m, i);
+                            let codes = list.code_row(self_m, i);
                             let dist = self.pq.adc_distance(&lut, codes);
                             local.push(Hit { id: list.ids[i], score: -dist });
                         }
@@ -348,6 +367,6 @@ impl IvfPqIndex {
             }
             return refine_flat.search(q, k);
         }
-        crate::types::stable_top_k(approx, k)
+        stable_top_k(approx, k)
     }
 }
