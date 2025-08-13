@@ -278,6 +278,7 @@ impl IvfPqIndex {
         }
         for list in &self.lists { h64(&mut h, list.ids.len() as u64); for id in &list.ids { h64(&mut h, *id); } }
         h
+        
     }
 
     /// Parallel ADC gather with per-thread partial top-R, then exact refine.
