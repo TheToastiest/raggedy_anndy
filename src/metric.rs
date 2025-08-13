@@ -2,7 +2,6 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric { L2, Cosine }
 
-
 #[inline]
 pub fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -30,7 +29,7 @@ pub fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     if na == 0.0 || nb == 0.0 { 0.0 } else { num / (na * nb) }
 }
 
-/// Convert a raw distance/sim into a unified **score** (higher is better).
+/// Convert raw distance/sim into a unified score (higher is better).
 #[inline]
 pub fn score(metric: Metric, q: &[f32], v: &[f32]) -> f32 {
     match metric {

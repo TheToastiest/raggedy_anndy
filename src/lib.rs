@@ -19,6 +19,10 @@ pub mod persist;
 pub mod header;
 pub mod embed;
 pub mod eval;
+pub mod pq;
+pub mod opq;
+pub mod ivfpq;
+pub mod par;
 
 pub use metric::Metric;
 pub use types::{Hit, stable_top_k};
