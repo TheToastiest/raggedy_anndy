@@ -1,143 +1,214 @@
 # raggedy\_anndy
 
-Deterministic ANN for RAG in Rust. Flat exact search and IVF Flat with seeded k means. Reproducible builds and searches, recall targets with Wilson 95 percent lower bounds, and a latency sweep harness.
+Deterministic ANN for RAG in Rust. Exact Flat, IVF‑Flat, and **IVF‑PQ with OPQ‑P** — all with seeded training, stable tie‑breaks, and build fingerprints so results are reproducible across runs and machines.
 
-## Features
+> Goal: ship profiles that hit **recall\@k ≥ 0.90** (by Wilson 95% lower bound) under a tight p95 budget.
 
-* Exact Flat index for L2 or cosine
-* IVF Flat with deterministic k means plus plus and stable assignment
-* Stable top k ordering by score then id
-* Build fingerprint to catch non deterministic builds
-* Sweep CLI that reports recall, Wilson 95 percent lower bound, p50 and p95 and p99 latency, and QPS
-* Optional pass or fail gating on a target lower bound
+---
 
-## Status
+## What’s in the box
 
-* Shipping: Flat, IVF Flat, seeded k means, deterministic search, sweep CLI
-* Planned: IVF PQ, OPQ, HNSW with deterministic insertion, sparse fusion for RAG
+**Indexes**
+
+* **Flat (Exact)** for Cosine or L2
+* **IVF‑Flat** (coarse k‑means + exact refine)
+* **IVF‑PQ** (ADC on residuals + optional exact re‑rank)
+
+  * **OPQ‑P** (learned permutation / PCA‑perm) to balance subspace variance
+  * Modes: `perm`, `pca`, `pca-perm`
+
+**Determinism**
+
+* Seeded **k‑means++** and PQ training
+* **Stable top‑k** by (score desc, id asc)
+* **Build fingerprint** over params/codebooks/centroids/list ids
+
+**CLI tools**
+
+* `sweep` – grid search over `nprobe`/`refine` (and PQ knobs) → CSV + summary
+* `freeze` – single fixed profile; hard gates on lb95/recall/p95; CI‑friendly
+* `ingest` – toy JSONL→CSV embedder (for demos/tests)
+
+**Quality metrics**
+
+* Recall\@k vs. Flat baseline
+* Wilson 95% lower bound
+* p50/p90/p95/p99 latency (per‑query), QPS
+
+**Extras**
+
+* Optional per‑id **tags** with `search_with_filter` masks
+* Tombstones + deterministic compaction
+* (Opt‑in) index **persist/load** helpers
+
+---
+
+## File tree (high level)
+
+```
+raggedy_anndy/
+├─ Cargo.toml
+└─ src/
+   ├─ lib.rs
+   ├─ metric.rs        # L2/Cosine + unified scoring
+   ├─ types.rs         # Hit, stable_top_k, etc.
+   ├─ seed.rs          # SplitMix64
+   ├─ flat.rs          # FlatIndex (exact)
+   ├─ kmeans.rs        # Seeded k‑means++
+   ├─ ivf.rs           # IVF‑Flat
+   ├─ pq.rs            # ProductQuantizer
+   ├─ opq.rs           # OPQ‑P (perm / pca / pca‑perm)
+   ├─ ivfpq.rs         # IVF‑PQ (ADC + OPQ‑P + refine)
+   ├─ par.rs           # parallel_map_indexed helper
+   ├─ eval.rs          # recall, Wilson bound, helpers
+   ├─ persist.rs       # (feature) save/load index
+   ├─ header.rs        # index header + fingerprint material
+   ├─ embed.rs         # toy embedder for ingest demo
+   └─ bin/
+      ├─ sweep.rs
+      ├─ freeze.rs
+      └─ ingest.rs
+```
+
+---
 
 ## Install
 
-Clone and build with stable Rust.
+Requires stable Rust.
 
 ```bash
 git clone https://github.com/TheToastiest/raggedy_anndy.git
 cd raggedy_anndy
-cargo build
+cargo build --release
 ```
 
-## Quick test
+Run tests:
 
 ```bash
 cargo test -q
 ```
 
-## Quick sweep
+---
 
-Run in release mode for realistic timing. This evaluates a grid of nprobe and refine values on synthetic data and writes a CSV.
+## Binaries & usage
+
+### 1) `freeze` – fixed profile, gates, and p95
+
+Single‑run evaluator for CI and reproducible bake‑offs.
+
+**Key flags (subset):**
+
+* Dataset: `--n`, `--dim`, `--metric {cosine|l2}`, `--k`, `--queries`, `--warmup`
+* Seeds: `--seed-data`, `--seed-queries`, `--seed-kmeans`
+* Backend: `--backend {ivf-flat|ivf-pq}`
+* IVF: `--nlist`, `--nprobe`, `--refine`
+* PQ: `--m`, `--nbits`, `--iters`, `--opq`, `--opq-mode {perm|pca|pca-perm}`, `--opq-sweeps`, `--store-vecs`
+* Gates: `--min-lb95`, `--min-recall`, `--max-p95-ms`
+* Threads: `--threads` (query‑level), `--intra` (intra‑search, if supported)
+
+**Example (a passing config on a laptop):**
 
 ```bash
-cargo run --release --bin freeze --backend ivf-pq --n 50000 --dim 256 --metric cosine --k 10  --nlist 2048 --nprobe 906 --refine 1200  --m 128 --nbits 8 --iters 60   --opq --opq-mode pca-perm --opq-sweeps 8  --queries 200 --warmup 5  --seed-data 42 --seed-queries 999 --seed-kmeans 7  --min-lb95 0.90 --min-recall 0.90 --max-p95-ms 40   --threads 2 --intra 8 --csv results.csv
-```
-Typical results on a laptop for cosine with N 50000 and dim 256 and k 10:
-
-* nprobe 1280 refine 1200 gives recall about 0.93 and lb95 about 0.92
-* nprobe 906 refine 2000 gives recall about 0.919 and lb95 about 0.900 with p95 > 30 ms
-
-
-After building the repo, you can also run sweep or freeze with the following command series
-```
-target\release\sweep.exe --backend ivf-pq --m 64 --nbits 8 --iters 25 --store-vecs   --n 4000 --dim 512 --metric cosine --k 10   --nlist 1024 --nprobe 512 --refine 1000,1500   --queries 200 --warmup 25   --seed-data 42 --seed-queries 999 --seed-kmeans 7   --target-lb 0.90 --enforce --csv pq_768_fix.csv      
-Dataset built in 8 ms (N=40000, dim=512, metric=Cosine)
-  nprobe   refine   recall     lb95    p50(ms)    p95(ms)        QPS
-     512     1000    0.956    0.946     25.958     32.772       37.6
-     512     1500    0.961    0.952     23.569     24.788       42.3
-BEST -> backend=IvfPq nprobe=512 refine=1500 recall=0.961 lb95=0.952 p95=24.788 ms
+./target/release/freeze \
+  --backend ivf-pq \
+  --n 50000 --dim 256 --metric cosine --k 5 \
+  --nlist 1536 --nprobe 906 --refine 2000 \
+  --m 128 --nbits 8 --iters 60 \
+  --opq --opq-mode pca-perm --opq-sweeps 8 \
+  --queries 200 --warmup 5 \
+  --seed-data 42 --seed-queries 999 --seed-kmeans 7 \
+  --min-lb95 0.90 --min-recall 0.90 --max-p95-ms 40 \
+  --threads 2 --intra 8
 ```
 
-## Enforce a target lower bound
+This prints recall, lb95, p50/p90/p95/p99, QPS, and fails non‑zero if any gate is violated. It also checks build+search determinism.
 
-Fail the run if the Wilson 95 percent lower bound falls below a target.
+---
 
+### 2) `sweep` – grid search → CSV
 
-## Output columns
+Grid over `nprobe` × `refine` (and PQ knobs when using IVF‑PQ). Writes a CSV and prints a compact table.
 
-The sweep prints and writes these fields per configuration:
+**Example:**
 
-* nprobe
-* refine
-* recall
-* lb95
-* p50 and p90 and p95 and p99 in microseconds in the CSV and p50 and p95 in milliseconds in the console
-* QPS
-* build determinism flag
-* build and eval time in milliseconds
-
-## Library usage
-
-Minimal example that builds IVF Flat and searches.
-
-```rust
-use raggedy_anndy::{Metric, IvfIndex, IvfParams, FlatIndex};
-
-fn main() {
-    let dim = 64;
-    let metric = Metric::Cosine;
-
-    // build data
-    let mut data: Vec<(u64, Vec<f32>)> = Vec::new();
-    for i in 0..1000u64 {
-        data.push((i, vec![0.0; dim])); // replace with real vectors
-    }
-
-    // build index
-    let params = IvfParams { nlist: 256, nprobe: 96, refine: 200, seed: 7 };
-    let ivf = IvfIndex::build(metric, dim, &data, params);
-
-    // search
-    let q = vec![0.0f32; dim];
-    let hits = ivf.search(&q, 10);
-    for h in hits { println!("{}\t{}", h.id, h.score); }
-}
+```bash
+./target/release/sweep \
+  --backend ivf-pq \
+  --n 50000 --dim 256 --metric cosine --k 10 \
+  --nlist 1536 --nprobe 704,840,906 --refine 1200,1600,2000 \
+  --m 128 --nbits 8 --iters 60 --opq --opq-mode pca-perm --opq-sweeps 8 \
+  --queries 200 --warmup 25 \
+  --seed-data 42 --seed-queries 999 --seed-kmeans 7 \
+  --csv results.csv
 ```
+
+**CSV columns:** `metric,n,dim,k,nlist,nprobe,refine,recall,lb95,p50_us,p90_us,p95_us,p99_us,qps,build_det,build_ms,eval_ms`
+
+To enforce quality in sweep, use `--target-lb 0.90 --enforce` (and optionally `--require-all`).
+
+---
+
+### 3) `ingest` – demo embedder for JSONL
+
+Reads `{id, text}` JSONL and writes `id,vec...` CSV with a seeded random embedder (for demos/tests only).
+
+```bash
+./target/release/ingest --input docs.jsonl --dim 768 --seed 12345 --normalize --out vectors.csv
+```
+
+---
+
+## Tuning cheat‑sheet
+
+* **Cosine + unit‑norm** is the default for text embeddings; enables stable OPQ/PQ behavior.
+* **nprobe** ↑ → recall ↑ (latency ↑). Good first knob.
+* **refine** ↑ → recall ↑ via exact re‑rank size. Keep `refine ≳ k`.
+* **m (PQ sub‑quantizers)**: more subspaces → higher ADC accuracy (slower encode, slightly bigger codes).
+* **OPQ‑P**: set `--opq --opq-mode pca-perm --opq-sweeps 6..12` for balanced subspace variance.
+* **store‑vecs**: if true, exact re‑rank uses in‑index floats (more RAM, faster refine). If false, you can plug a remote store later.
+
+Typical good starting point (Cosine, dim=256, N≈50k, k∈{5,10}):
+
+* `nlist=1536`, `nprobe≈800–900`, `refine≈1500–2000`, `m=128`, `nbits=8`, `iters≈60–80`, `opq-mode=pca-perm`, `opq-sweeps≈6–10`.
+
+---
 
 ## Reproducibility model
 
-* Global seeds are carried through k means, dataset generation in tests, and query generation
-* Exact math path with fixed f32 or f64 per operation
-* Stable sorting of candidates by score then id
-* Deterministic assignment to centroids with id tiebreakers
-* Build fingerprint covers centroid bits and per list ids
+* All trainers and data/query generators are seeded.
+* Fixed f32 math path; stable sort by (score desc, id asc).
+* Deterministic tie‑breaks and list insertion order.
+* `fingerprint()` covers params, centroids, PQ codebooks, and per‑list ids.
 
-## Profiles
+---
 
-Use the sweep to select a profile that meets your recall and latency requirements. For the synthetic setup above a good default is nprobe 96 and refine 200. Persist the choice in your app configuration and pass it into IvfParams.
+## Status
 
-## CI example
+**Shipping**
 
-Run the sweep in CI and fail if the best configuration does not meet your target lower bound.
+* Flat, IVF‑Flat, IVF‑PQ (ADC) with optional exact refine
+* OPQ‑P (`perm`, `pca`, `pca‑perm`)
+* Sweep + Freeze CLIs with Wilson lb95 gates
+* Deterministic build/search + fingerprints
+* Tags, tombstones, compact; (feature) persist/load
 
-```yaml
-jobs:
-  sweep:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo run --release --bin sweep -- --n N --dim 32 --metric cosine --k 10 --nlist 256 --nprobe 96 --refine 200 --queries 200 --warmup 25 --target-lb 0.90 --enforce --csv results.csv
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sweep-results
-          path: results.csv
-```
+**Planned**
+
+* HNSW with deterministic insertion
+* Sparse fusion for RAG
+* Optional remote refine (e.g., RAM KV cache)
+
+---
 
 ## License
 
-Dual licensed under MIT or Apache 2.0 at your option.
+Dual‑licensed under MIT or Apache‑2.0.
 
-* See LICENSE MIT and LICENSE APACHE for details
-* You may not use any file except in compliance with one of the licenses
+* See `LICENSE-MIT` and `LICENSE-APACHE` for details.
+* You may not use any file except in compliance with one of the licenses.
+
+---
 
 ## Acknowledgments
 
-This crate was inspired by FAISS style indexing and common RAG retrieval patterns. All code here is original to this repository.
+Inspired by FAISS‑style indexing and common RAG retrieval patterns. Implementation is original to this repository.
