@@ -48,26 +48,26 @@ Deterministic ANN for RAG in Rust. Exact Flat, IVF‑Flat, and **IVF‑PQ with O
 ```
 raggedy_anndy/
 ├─ Cargo.toml
-└─ src/
-   ├─ lib.rs
-   ├─ metric.rs        # L2/Cosine + unified scoring
-   ├─ types.rs         # Hit, stable_top_k, etc.
-   ├─ seed.rs          # SplitMix64
-   ├─ flat.rs          # FlatIndex (exact)
-   ├─ kmeans.rs        # Seeded k‑means++
-   ├─ ivf.rs           # IVF‑Flat
-   ├─ pq.rs            # ProductQuantizer
-   ├─ opq.rs           # OPQ‑P (perm / pca / pca‑perm)
-   ├─ ivfpq.rs         # IVF‑PQ (ADC + OPQ‑P + refine)
-   ├─ par.rs           # parallel_map_indexed helper
-   ├─ eval.rs          # recall, Wilson bound, helpers
-   ├─ persist.rs       # (feature) save/load index
-   ├─ header.rs        # index header + fingerprint material
-   ├─ embed.rs         # toy embedder for ingest demo
-   └─ bin/
-      ├─ sweep.rs
-      ├─ freeze.rs
-      └─ ingest.rs
+├─ src/
+|   ├─ lib.rs
+|   ├─ metric.rs        # L2/Cosine + unified scoring
+|   ├─ types.rs         # Hit, stable_top_k, etc.
+|   ├─ seed.rs          # SplitMix64
+|   ├─ flat.rs          # FlatIndex (exact)
+|   ├─ kmeans.rs        # Seeded k‑means++
+|   ├─ ivf.rs           # IVF‑Flat
+|   ├─ pq.rs            # ProductQuantizer
+|   ├─ opq.rs           # OPQ‑P (perm / pca / pca‑perm)
+|   ├─ ivfpq.rs         # IVF‑PQ (ADC + OPQ‑P + refine)
+|   ├─ par.rs           # parallel_map_indexed helper
+|   ├─ eval.rs          # recall, Wilson bound, helpers
+|   ├─ persist.rs       # (feature) save/load index
+|   ├─ header.rs        # index header + fingerprint material
+|   ├─ embed.rs         # toy embedder for ingest demo
+└─ bin/
+    ├─ sweep.rs
+    ├─ freeze.rs
+    └─ ingest.rs
 ```
 
 ---
