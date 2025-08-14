@@ -37,37 +37,28 @@ cargo test -q
 Run in release mode for realistic timing. This evaluates a grid of nprobe and refine values on synthetic data and writes a CSV.
 
 ```bash
-cargo run --release --bin sweep -- \
-  --n 4000 --dim 32 --metric cosine --k 10 \
-  --nlist 256 --nprobe 64,96,128 --refine 200,300,400 \
-  --queries 200 --warmup 25 --seed-data 42 --seed-queries 999 --seed-kmeans 7 \
-  --csv results.csv
+cargo run --release --bin freeze --backend ivf-pq --n 50000 --dim 256 --metric cosine --k 10  --nlist 2048 --nprobe 906 --refine 1200  --m 128 --nbits 8 --iters 60   --opq --opq-mode pca-perm --opq-sweeps 8  --queries 200 --warmup 5  --seed-data 42 --seed-queries 999 --seed-kmeans 7  --min-lb95 0.90 --min-recall 0.90 --max-p95-ms 40   --threads 2 --intra 8 --csv results.csv
 ```
+Typical results on a laptop for cosine with N 50000 and dim 256 and k 10:
 
-After building the repo, you can also run sweep with the following command series
+* nprobe 1280 refine 1200 gives recall about 0.93 and lb95 about 0.92
+* nprobe 906 refine 2000 gives recall about 0.919 and lb95 about 0.900 with p95 > 30 ms
+
+
+After building the repo, you can also run sweep or freeze with the following command series
 ```
 target\release\sweep.exe --backend ivf-pq --m 64 --nbits 8 --iters 25 --store-vecs   --n 4000 --dim 512 --metric cosine --k 10   --nlist 1024 --nprobe 512 --refine 1000,1500   --queries 200 --warmup 25   --seed-data 42 --seed-queries 999 --seed-kmeans 7   --target-lb 0.90 --enforce --csv pq_768_fix.csv      
-Dataset built in 8 ms (N=4000, dim=512, metric=Cosine)
+Dataset built in 8 ms (N=40000, dim=512, metric=Cosine)
   nprobe   refine   recall     lb95    p50(ms)    p95(ms)        QPS
      512     1000    0.956    0.946     25.958     32.772       37.6
      512     1500    0.961    0.952     23.569     24.788       42.3
 BEST -> backend=IvfPq nprobe=512 refine=1500 recall=0.961 lb95=0.952 p95=24.788 ms
 ```
-Typical results on a laptop for cosine with N 4000 and dim 32 and k 10:
-
-* nprobe 96 refine 200 gives recall about 0.963 and lb95 about 0.954
-* nprobe 128 refine 200 gives recall about 0.987 and lb95 about 0.980 with p95 near 0.42 ms
 
 ## Enforce a target lower bound
 
 Fail the run if the Wilson 95 percent lower bound falls below a target.
 
-```bash
-cargo run --release --bin sweep -- \
-  --n 4000 --dim 32 --metric cosine --k 10 \
-  --nlist 256 --nprobe 96 --refine 200 \
-  --queries 200 --warmup 25 --target-lb 0.90 --enforce
-```
 
 ## Output columns
 
