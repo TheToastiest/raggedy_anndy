@@ -5,7 +5,7 @@ use rand::rngs::StdRng;
 
 use raggedy_anndy::par::parallel_map_indexed;
 use raggedy_anndy::{Metric, FlatIndex, IvfIndex, IvfParams};
-use raggedy_anndy::ivfpq::{IvfPqIndex, IvfPqParams};
+use raggedy_anndy::ivfpq::{IvfPqIndex, IvfPqParams, OpqMode};
 use raggedy_anndy::eval::wilson_lower_bound;
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
@@ -13,6 +13,18 @@ enum MetricArg { Cosine, L2 }
 impl From<MetricArg> for Metric {
     fn from(m: MetricArg) -> Self {
         match m { MetricArg::Cosine => Metric::Cosine, MetricArg::L2 => Metric::L2 }
+    }
+}
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum OpqModeArg { Perm, Pca, PcaPerm }
+
+impl From<OpqModeArg> for OpqMode {
+    fn from(m: OpqModeArg) -> Self {
+        match m {
+            OpqModeArg::Perm => OpqMode::Perm,
+            OpqModeArg::Pca => OpqMode::Pca,
+            OpqModeArg::PcaPerm => OpqMode::PcaPerm,
+        }
     }
 }
 
@@ -41,6 +53,8 @@ struct Args {
     #[arg(long, default_value_t=8)] nbits: u8,
     #[arg(long, default_value_t=25)] iters: usize,
     #[arg(long, default_value_t=false)] opq: bool,
+    #[arg(long, value_enum, default_value_t=OpqModeArg::PcaPerm)] opq_mode: OpqModeArg,
+    #[arg(long, default_value_t=6)] opq_sweeps: usize,
     #[arg(long, default_value_t=true)] store_vecs: bool,
 
     // eval
@@ -186,12 +200,15 @@ fn run_ivf_pq(
     nbits: u8,
     iters: usize,
     opq: bool,
+    opq_mode: OpqMode,
+    opq_sweeps: usize,
     store_vecs: bool,
     threads: usize,
+
 ) -> (Row, u128, bool) {
     let params = IvfPqParams {
         nlist, nprobe, refine, seed: seed_kmeans,
-        m, nbits, iters, use_opq: opq, store_vecs,
+        m, nbits, iters, use_opq: opq, store_vecs, opq_mode, opq_sweeps,
     };
 
     let t0 = Instant::now();
@@ -296,7 +313,7 @@ fn main() {
                         let alt = parent.join(format!("{}-{}.csv", stem, ts));
                         eprintln!("CSV locked, writing to {}", alt.display());
                         let mut f = File::create(&alt).expect("csv open alt");
-                        writeln!(f, "backend,metric,n,dim,k,nlist,nprobe,refine,recall,lb95,p50_us,p90_us,p95_us,p99_us,qps,build_det,build_ms,eval_ms,m,nbits,iters,opq,store_vecs,threads").ok();
+                        writeln!(f, "backend,metric,n,dim,k,nlist,nprobe,refine,recall,lb95,p50_us,p90_us,p95_us,p99_us,qps,build_det,build_ms,eval_ms,m,nbits,iters,opq,opq_mode,opq_sweeps,store_vecs,threads").ok();
                         Some(Box::new(f))
                     } else { panic!("csv open: {}", e); }
                 }
@@ -322,7 +339,10 @@ fn main() {
                 Backend::IvfPq => run_ivf_pq(
                     metric, args.dim, &data, &flat, &queries, args.warmup, args.k,
                     args.nlist, nprobe, refine, args.seed_kmeans,
-                    args.m, args.nbits, args.iters, args.opq, args.store_vecs,
+                    args.m, args.nbits, args.iters, args.opq,
+                    args.opq_mode.into(),
+                    args.opq_sweeps,
+                    args.store_vecs,
                     args.threads,
                 ),
             };
@@ -337,7 +357,7 @@ fn main() {
             if let Some(w) = csv.as_mut() {
                 writeln!(
                     w,
-                    "{:?},{:?},{},{},{},{},{},{},{:.6},{:.6},{:.0},{:.0},{:.0},{:.0},{:.2},{},{},{},{},{},{},{},{},{}",
+                    "{:?},{:?},{},{},{},{},{},{},{:.6},{:.6},{:.0},{:.0},{:.0},{:.0},{:.2},{},{},{},{},{},{},{},{},{},{},{}",
                     args.backend, metric, args.n, args.dim, args.k, args.nlist, nprobe, refine,
                     row.recall, row.lb,
                     (row.p50_ms * 1000.0).round(),
@@ -349,9 +369,12 @@ fn main() {
                     if matches!(args.backend, Backend::IvfPq) { args.nbits as i64 } else { -1 },
                     if matches!(args.backend, Backend::IvfPq) { args.iters as i64 } else { -1 },
                     if matches!(args.backend, Backend::IvfPq) { args.opq } else { false },
+                    if matches!(args.backend, Backend::IvfPq) { format!("{:?}", args.opq_mode) } else { "-".to_string() },
+                    if matches!(args.backend, Backend::IvfPq) { args.opq_sweeps as i64 } else { -1 },
                     if matches!(args.backend, Backend::IvfPq) { args.store_vecs } else { false },
                     args.threads,
                 ).ok();
+
             }
 
             rows.push({

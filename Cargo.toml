@@ -8,6 +8,10 @@ license = "MIT OR Apache-2.0"
 description = "Deterministic ANN + RAG building blocks (Flat, IVF-Flat)"
 
 [[bin]]
+
+name = "freeze"
+path = "bin/freeze.rs"
+[[bin]]
 name = "sweep"
 path = "bin/sweep.rs"
 
