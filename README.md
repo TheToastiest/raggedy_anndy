@@ -1,6 +1,6 @@
 # raggedy\_anndy
 
-Deterministic ANN for RAG in Rust. Exact Flat, IVF‑Flat, and **IVF‑PQ with OPQ‑P** — all with seeded training, stable tie‑breaks, and build fingerprints so results are reproducible across runs and machines.
+Deterministic ANN for RAG in Rust. Exact Flat, IVF‑Flat, and **IVF‑PQ with OPQ‑P**, all with seeded training, stable tie‑breaks, and build fingerprints so results are reproducible across runs and machines.
 
 > Goal: ship profiles that hit **recall\@k ≥ 0.90** (by Wilson 95% lower bound) under a tight p95 budget.
 
