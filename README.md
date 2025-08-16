@@ -109,16 +109,7 @@ Single‑run evaluator for CI and reproducible bake‑offs.
 **Example (a passing config on a laptop):**
 
 ```bash
-./target/release/freeze \
-  --backend ivf-pq \
-  --n 50000 --dim 256 --metric cosine --k 5 \
-  --nlist 1536 --nprobe 906 --refine 2000 \
-  --m 128 --nbits 8 --iters 60 \
-  --opq --opq-mode pca-perm --opq-sweeps 8 \
-  --queries 200 --warmup 5 \
-  --seed-data 42 --seed-queries 999 --seed-kmeans 7 \
-  --min-lb95 0.90 --min-recall 0.90 --max-p95-ms 40 \
-  --threads 2 --intra 8
+./target/release/freeze --backend ivf-pq --n 50000 --dim 256 --metric cosine --k 5 --nlist 1536 --nprobe 906 --refine 2000 --m 128 --nbits 8 --iters 60 --opq --opq-mode pca-perm --opq-sweeps 8 --queries 200 --warmup 5 --seed-data 42 --seed-queries 999 --seed-kmeans 7 --min-lb95 0.90 --min-recall 0.90 --max-p95-ms 40 --threads 2 --intra 8
 ```
 
 This prints recall, lb95, p50/p90/p95/p99, QPS, and fails non‑zero if any gate is violated. It also checks build+search determinism.
@@ -132,14 +123,7 @@ Grid over `nprobe` × `refine` (and PQ knobs when using IVF‑PQ). Writes a CSV 
 **Example:**
 
 ```bash
-./target/release/sweep \
-  --backend ivf-pq \
-  --n 50000 --dim 256 --metric cosine --k 10 \
-  --nlist 1536 --nprobe 704,840,906 --refine 1200,1600,2000 \
-  --m 128 --nbits 8 --iters 60 --opq --opq-mode pca-perm --opq-sweeps 8 \
-  --queries 200 --warmup 25 \
-  --seed-data 42 --seed-queries 999 --seed-kmeans 7 \
-  --csv results.csv
+./target/release/sweep --backend ivf-pq --n 50000 --dim 256 --metric cosine --k 10 --nlist 1536 --nprobe 704,840,906 --refine 1200,1600,2000 --m 128 --nbits 8 --iters 60 --opq --opq-mode pca-perm --opq-sweeps 8 --queries 200 --warmup 25 --seed-data 42 --seed-queries 999 --seed-kmeans 7 --csv results.csv
 ```
 
 **CSV columns:** `metric,n,dim,k,nlist,nprobe,refine,recall,lb95,p50_us,p90_us,p95_us,p99_us,qps,build_det,build_ms,eval_ms`
