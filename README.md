@@ -1,6 +1,6 @@
 # raggedy\_anndy
 
-Deterministic ANN for RAG in Rust. Exact Flat, IVF‑Flat, and **IVF‑PQ with OPQ‑P** — all with seeded training, stable tie‑breaks, and build fingerprints so results are reproducible across runs and machines.
+Deterministic ANN for RAG in Rust. Exact Flat, IVF‑Flat, and **IVF‑PQ with OPQ‑P**, all with seeded training, stable tie‑breaks, and build fingerprints so results are reproducible across runs and machines.
 
 > Goal: ship profiles that hit **recall\@k ≥ 0.90** (by Wilson 95% lower bound) under a tight p95 budget.
 
@@ -48,26 +48,26 @@ Deterministic ANN for RAG in Rust. Exact Flat, IVF‑Flat, and **IVF‑PQ with O
 ```
 raggedy_anndy/
 ├─ Cargo.toml
-└─ src/
-   ├─ lib.rs
-   ├─ metric.rs        # L2/Cosine + unified scoring
-   ├─ types.rs         # Hit, stable_top_k, etc.
-   ├─ seed.rs          # SplitMix64
-   ├─ flat.rs          # FlatIndex (exact)
-   ├─ kmeans.rs        # Seeded k‑means++
-   ├─ ivf.rs           # IVF‑Flat
-   ├─ pq.rs            # ProductQuantizer
-   ├─ opq.rs           # OPQ‑P (perm / pca / pca‑perm)
-   ├─ ivfpq.rs         # IVF‑PQ (ADC + OPQ‑P + refine)
-   ├─ par.rs           # parallel_map_indexed helper
-   ├─ eval.rs          # recall, Wilson bound, helpers
-   ├─ persist.rs       # (feature) save/load index
-   ├─ header.rs        # index header + fingerprint material
-   ├─ embed.rs         # toy embedder for ingest demo
-   └─ bin/
-      ├─ sweep.rs
-      ├─ freeze.rs
-      └─ ingest.rs
+├─ src/
+|   ├─ lib.rs
+|   ├─ metric.rs        # L2/Cosine + unified scoring
+|   ├─ types.rs         # Hit, stable_top_k, etc.
+|   ├─ seed.rs          # SplitMix64
+|   ├─ flat.rs          # FlatIndex (exact)
+|   ├─ kmeans.rs        # Seeded k‑means++
+|   ├─ ivf.rs           # IVF‑Flat
+|   ├─ pq.rs            # ProductQuantizer
+|   ├─ opq.rs           # OPQ‑P (perm / pca / pca‑perm)
+|   ├─ ivfpq.rs         # IVF‑PQ (ADC + OPQ‑P + refine)
+|   ├─ par.rs           # parallel_map_indexed helper
+|   ├─ eval.rs          # recall, Wilson bound, helpers
+|   ├─ persist.rs       # (feature) save/load index
+|   ├─ header.rs        # index header + fingerprint material
+|   ├─ embed.rs         # toy embedder for ingest demo
+└─ bin/
+    ├─ sweep.rs
+    ├─ freeze.rs
+    └─ ingest.rs
 ```
 
 ---
@@ -109,16 +109,7 @@ Single‑run evaluator for CI and reproducible bake‑offs.
 **Example (a passing config on a laptop):**
 
 ```bash
-./target/release/freeze \
-  --backend ivf-pq \
-  --n 50000 --dim 256 --metric cosine --k 5 \
-  --nlist 1536 --nprobe 906 --refine 2000 \
-  --m 128 --nbits 8 --iters 60 \
-  --opq --opq-mode pca-perm --opq-sweeps 8 \
-  --queries 200 --warmup 5 \
-  --seed-data 42 --seed-queries 999 --seed-kmeans 7 \
-  --min-lb95 0.90 --min-recall 0.90 --max-p95-ms 40 \
-  --threads 2 --intra 8
+./target/release/freeze --backend ivf-pq --n 50000 --dim 256 --metric cosine --k 5 --nlist 1536 --nprobe 906 --refine 2000 --m 128 --nbits 8 --iters 60 --opq --opq-mode pca-perm --opq-sweeps 8 --queries 200 --warmup 5 --seed-data 42 --seed-queries 999 --seed-kmeans 7 --min-lb95 0.90 --min-recall 0.90 --max-p95-ms 40 --threads 2 --intra 8
 ```
 
 This prints recall, lb95, p50/p90/p95/p99, QPS, and fails non‑zero if any gate is violated. It also checks build+search determinism.
@@ -132,14 +123,7 @@ Grid over `nprobe` × `refine` (and PQ knobs when using IVF‑PQ). Writes a CSV 
 **Example:**
 
 ```bash
-./target/release/sweep \
-  --backend ivf-pq \
-  --n 50000 --dim 256 --metric cosine --k 10 \
-  --nlist 1536 --nprobe 704,840,906 --refine 1200,1600,2000 \
-  --m 128 --nbits 8 --iters 60 --opq --opq-mode pca-perm --opq-sweeps 8 \
-  --queries 200 --warmup 25 \
-  --seed-data 42 --seed-queries 999 --seed-kmeans 7 \
-  --csv results.csv
+./target/release/sweep --backend ivf-pq --n 50000 --dim 256 --metric cosine --k 10 --nlist 1536 --nprobe 704,840,906 --refine 1200,1600,2000 --m 128 --nbits 8 --iters 60 --opq --opq-mode pca-perm --opq-sweeps 8 --queries 200 --warmup 25 --seed-data 42 --seed-queries 999 --seed-kmeans 7 --csv results.csv
 ```
 
 **CSV columns:** `metric,n,dim,k,nlist,nprobe,refine,recall,lb95,p50_us,p90_us,p95_us,p99_us,qps,build_det,build_ms,eval_ms`
