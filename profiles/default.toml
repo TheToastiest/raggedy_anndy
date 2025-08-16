@@ -1,0 +1,52 @@
+# profiles/default.toml
+# Default “freeze” profile — deterministic, CI-friendly.
+
+[freeze]
+backend = "ivf-pq"       # "ivf-flat" | "ivf-pq"
+metric  = "cosine"       # "cosine" | "l2"
+n   = 20000
+dim = 256
+k   = 5
+
+# IVF coarse params
+nlist  = 1536
+nprobe = 906
+refine = 400
+
+# PQ / OPQ knobs
+[pq]
+m          = 128
+nbits      = 8
+iters      = 60
+opq        = true
+opq_mode   = "pca-perm"  # "perm" | "pca" | "pca-perm"
+opq_sweeps = 8
+store_vecs = true
+
+# Evaluation / threading
+[eval]
+queries = 200
+warmup  = 5
+threads = 2      # query-level parallelism
+intra   = 8      # intra-search (if supported by backend)
+
+# Seeds (determinism)
+[seeds]
+data    = 42
+queries = 999
+kmeans  = 7
+
+# Gates (freeze will fail if any violated)
+[gates]
+min_lb95    = 0.90
+min_recall  = 0.90
+max_p95_ms  = 40.0
+
+# Optional: where to write CSVs if your runner supports it
+[output]
+csv = "results/default_freeze.csv"
+
+# --- (Optional) sweep presets; uncomment if you want a default grid ---
+# [sweep]
+# nprobe = [704, 840, 906]
+# refine = [200, 400, 800, 1200, 2000]

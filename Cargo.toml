@@ -8,9 +8,13 @@ license = "MIT OR Apache-2.0"
 description = "Deterministic ANN + RAG building blocks (Flat, IVF-Flat)"
 
 [[bin]]
-
 name = "freeze"
 path = "bin/freeze.rs"
+
+[[bin]]
+name = "raggedy_anndy"
+path = "bin/rn_ui.rs"
+
 [[bin]]
 name = "sweep"
 path = "bin/sweep.rs"
@@ -35,6 +39,14 @@ serde_json = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"] }
 rand = "0.8" # only for test data generation
 nalgebra = { version = "0.32", default-features = false, features = ["std"] }
+axum = { version = "0.7", features = ["macros", "multipart"] }
+http = "1.3.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tower = "0.4"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+thiserror = "2.0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
 proptest = "1"
