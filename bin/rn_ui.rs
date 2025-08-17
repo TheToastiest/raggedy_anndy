@@ -20,7 +20,7 @@
 use std::{sync::Arc, time::Instant};
 
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, State},
     http::StatusCode,
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -185,7 +185,7 @@ impl IntoResponse for UiErr {
 // ------------------------------
 
 fn random_unit_vec(rng: &mut rand::rngs::StdRng, dim: usize) -> Vec<f32> {
-    use rand::{Rng, SeedableRng};
+    use rand::{Rng};
     let mut v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() - 0.5).collect();
     let mut n = 0.0f32; for x in &v { n += *x * *x; } let n = n.sqrt();
     if n > 0.0 { for x in v.iter_mut() { *x /= n; } }

@@ -62,7 +62,7 @@ impl IvfIndex {
         // lists v2
         let lb = fs::read(dir.join("lists.bin"))?;
         let mut p = 0usize;
-        let mut u32_at = |p:&mut usize| { let mut b=[0u8;4]; b.copy_from_slice(&lb[*p..*p+4]); *p+=4; u32::from_le_bytes(b) as usize };
+        let u32_at = |p:&mut usize| { let mut b=[0u8;4]; b.copy_from_slice(&lb[*p..*p+4]); *p+=4; u32::from_le_bytes(b) as usize };
         let nlist = u32_at(&mut p);
         let mut lists: Vec<ListFlat> = Vec::with_capacity(nlist);
         for _ in 0..nlist {

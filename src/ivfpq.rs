@@ -245,7 +245,7 @@ impl IvfPqIndex {
         if approx.is_empty() { return Vec::new(); }
 
         // Keep top R by approximate score, stable ties
-        let mut top_r = stable_top_k(approx, refine);
+        let top_r = stable_top_k(approx, refine);
 
         // 3) Exact re-rank with stored floats (if available)
         if self.params.store_vecs {

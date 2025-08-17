@@ -331,7 +331,7 @@ fn main() {
     for &nprobe in &nprobe_list {
         for &refine in &refine_list {
             let t_cfg0 = Instant::now();
-            let (mut row, _sum_us, det) = match args.backend {
+            let (row, _sum_us, det) = match args.backend {
                 Backend::IvfFlat => run_ivf_flat(
                     metric, args.dim, &data, &flat, &queries, args.warmup, args.k,
                     args.nlist, nprobe, refine, args.seed_kmeans, args.threads,

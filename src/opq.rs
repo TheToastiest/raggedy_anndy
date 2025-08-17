@@ -58,7 +58,7 @@ impl Opq {
     pub fn apply(&self, x: &[f32]) -> Vec<f32> {
         assert_eq!(x.len(), self.dim);
         // y0 = R * x
-        let mut y0: Vec<f32> = if let Some(rm) = &self.r {
+        let y0: Vec<f32> = if let Some(rm) = &self.r {
             let d = self.dim;
             let mut out = vec![0.0f32; d];
             // Row-major: out[i] = dot(R[i,*], x)

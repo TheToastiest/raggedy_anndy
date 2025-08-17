@@ -3,7 +3,6 @@
 // Trains per-subspace codebooks using seeded k-means on residuals.
 
 use crate::kmeans::kmeans_seeded;
-use crate::metric;
 use crate::metric::Metric;
 
 #[derive(Clone, Debug)]

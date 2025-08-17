@@ -1,5 +1,3 @@
-use crate::{FlatIndex, Metric};
-
 /// Recall@k: fraction of true neighbors (from exact Flat) recovered by an ANN result set.
 pub fn recall_at_k(true_ids: &[u64], ann_ids: &[u64]) -> f32 {
     let k = true_ids.len().min(ann_ids.len());
@@ -25,7 +23,7 @@ pub fn wilson_lower_bound(successes: usize, trials: usize, z: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ivf::{IvfIndex, IvfParams}, metric, types::stable_top_k};
+    use crate::{ivf::{IvfIndex, IvfParams}};
     use rand::{Rng, SeedableRng};
     use rand::rngs::StdRng;
 
