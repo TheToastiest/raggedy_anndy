@@ -11,9 +11,9 @@ description = "Deterministic ANN + RAG building blocks (Flat, IVF-Flat)"
 name = "freeze"
 path = "bin/freeze.rs"
 
-[[bin]]
-name = "raggedy_anndy"
-path = "bin/rn_ui.rs"
+#[[bin]]
+#name = "raggedy_anndy"
+#path = "bin/rn_ui.rs"
 
 [[bin]]
 name = "sweep"

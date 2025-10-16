@@ -31,34 +31,45 @@ impl ListFlat {
 pub struct IvfIndex {
     pub header: IndexHeader,
     pub params: IvfParams,
-    pub centroids: Vec<Vec<f32>>, // [nlist][dim]
-    pub lists: Vec<ListFlat>,     // IVF-Flat storage
+    pub centroids: Vec<Vec<f32>>, // [nlist][dim] (normalized if Cosine)
+    pub lists: Vec<ListFlat>,     // IVF-Flat storage (vectors normalized if Cosine)
+}
+
+#[inline]
+fn normalize_inplace(v: &mut [f32]) {
+    let mut n = 0.0f32; for &x in v.iter() { n += x*x; }
+    if n > 0.0 { let inv = n.sqrt().recip(); for x in v { *x *= inv; } }
 }
 
 impl IvfIndex {
     pub fn build(metric: Metric, dim: usize, data: &[(u64, Vec<f32>)], mut params: IvfParams) -> Self {
         let n = data.len();
         assert!(n > 0, "IvfIndex::build requires at least one vector (N=0)");
-        // Clamp nlist to [1, N] so we never panic on small datasets.
+
+        // Clamp nlist → [1, N]
         if params.nlist == 0 { params.nlist = 1; }
-        if params.nlist > n {
-            #[cfg(debug_assertions)]
-            eprintln!("note: clamping nlist {} to N {}", params.nlist, n);
-            params.nlist = n;
+        if params.nlist > n { params.nlist = n; }
+
+        // For Cosine, normalize once up-front so search can use pure dot.
+        let mut train_vecs: Vec<Vec<f32>> = data.iter().map(|(_, v)| v.clone()).collect();
+        if matches!(metric, Metric::Cosine) {
+            for v in &mut train_vecs { normalize_inplace(v); }
         }
-        // ... keep the rest of the function the same, but use `params.nlist` from here on ...
 
+        // K-means in the SAME metric space we will search.
+        let mut centers = kmeans_seeded(&train_vecs, params.nlist, metric, params.seed, 50);
+        if matches!(metric, Metric::Cosine) {
+            for c in &mut centers { normalize_inplace(c); }
+        }
 
-        let centers = kmeans_seeded(
-            &data.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
-            params.nlist, metric, params.seed, 50);
-
+        // Create empty lists
         let mut lists: Vec<ListFlat> = (0..params.nlist)
             .map(|_| ListFlat{ ids:Vec::new(), vecs:Vec::new(), tomb:Vec::new(), tags:None })
             .collect();
 
-        // assign by nearest centroid (id tiebreak)
-        for (id, v) in data.iter() {
+        // Assign by nearest centroid (id tiebreak). Use normalized vectors for Cosine.
+        for (i, (id, _)) in data.iter().enumerate() {
+            let v = &train_vecs[i];
             let mut best = 0usize; let mut bestd = f32::INFINITY; let mut bestid = *id;
             for (c, ctr) in centers.iter().enumerate() {
                 let d = match metric {
@@ -69,11 +80,11 @@ impl IvfIndex {
             }
             let list = &mut lists[best];
             list.ids.push(*id);
-            list.vecs.extend_from_slice(v);
+            list.vecs.extend_from_slice(v); // already normalized if Cosine
             list.tomb.push(0);
         }
 
-        // stable id order per list (reorder vecs/tomb/tags accordingly)
+        // Stable id order per list (reorder vecs/tomb/tags accordingly)
         for list in lists.iter_mut() {
             let mut idx: Vec<usize> = (0..list.ids.len()).collect();
             idx.sort_by_key(|&i| list.ids[i]);
@@ -105,12 +116,16 @@ impl IvfIndex {
     /// Upsert vector and optional tag. Keeps id-sort; replaces in-place if found.
     pub fn upsert(&mut self, id: u64, v: &[f32], tag: Option<u64>) {
         assert_eq!(v.len(), self.header.dim);
+        // Normalize for cosine so storage is consistent.
+        let mut vstore: Vec<f32> = v.to_vec();
+        if matches!(self.header.metric, Metric::Cosine) { normalize_inplace(&mut vstore); }
+
         // pick list by highest centroid score
         let mut best = 0usize; let mut bests = f32::NEG_INFINITY;
         for (i, c) in self.centroids.iter().enumerate() {
             let s = match self.header.metric {
-                Metric::L2 => -metric::l2_distance(v, c),
-                Metric::Cosine => metric::cosine_sim(v, c),
+                Metric::L2 => -metric::l2_distance(&vstore, c),
+                Metric::Cosine => metric::cosine_sim(&vstore, c),
             };
             if s > bests { bests = s; best = i; }
         }
@@ -118,7 +133,7 @@ impl IvfIndex {
         match list.ids.binary_search(&id) {
             Ok(pos) => {
                 let s = pos * self.header.dim;
-                for d in 0..self.header.dim { list.vecs[s+d] = v[d]; }
+                for d in 0..self.header.dim { list.vecs[s+d] = vstore[d]; }
                 list.tomb[pos] = 0;
                 if let Some(mask) = tag {
                     if let Some(tags) = &mut list.tags { tags[pos] = mask; }
@@ -129,7 +144,7 @@ impl IvfIndex {
                 list.ids.insert(pos, id);
                 list.tomb.insert(pos, 0);
                 let s = pos * self.header.dim;
-                list.vecs.splice(s..s, v.iter().cloned());
+                list.vecs.splice(s..s, vstore.into_iter());
                 if let Some(mask) = tag {
                     if let Some(tags) = &mut list.tags { tags.insert(pos, mask); }
                     else { let mut t = vec![0u64; list.ids.len()-1]; t.insert(pos, mask); list.tags = Some(t); }
@@ -158,23 +173,46 @@ impl IvfIndex {
         }
     }
 
+    #[inline]
+    fn normalized_query<'a>(&self, q: &'a [f32]) -> Vec<f32> {
+        if matches!(self.header.metric, Metric::Cosine) {
+            let mut qq = q.to_vec();
+            normalize_inplace(&mut qq); qq
+        } else { Vec::new() } // sentinel: empty means "use q as-is"
+    }
+
+    /// Rank centroids and return the top nprobe list indices.
+    fn select_probe_lists(&self, q: &[f32]) -> Vec<usize> {
+        let metric = self.header.metric;
+        let qbuf = self.normalized_query(q);
+        let qref: &[f32] = if qbuf.is_empty() { q } else { &qbuf };
+
+        let nprobe = self.params.nprobe.min(self.centroids.len());
+        let mut scores: Vec<(usize, f32)> = self.centroids.iter().enumerate().map(|(i,c)| {
+            let s = match metric { Metric::L2 => -metric::l2_distance(qref, c), Metric::Cosine => metric::cosine_sim(qref, c) };
+            (i, s)
+        }).collect();
+        // partial select would be faster, but nlist is small; full sort keeps determinism
+        scores.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
+        scores.truncate(nprobe);
+        scores.into_iter().map(|(i,_)| i).collect()
+    }
+
     /// Search with optional required tag mask. A hit must satisfy (tags[id] & mask) == mask.
     pub fn search_with_filter(&self, q: &[f32], k: usize, required_tag: Option<u64>) -> Vec<Hit> {
         assert_eq!(q.len(), self.header.dim);
         let dim = self.header.dim;
-        let nprobe = self.params.nprobe.min(self.centroids.len());
+        let metric = self.header.metric;
+
+        // Use normalized query for Cosine
+        let qbuf = self.normalized_query(q);
+        let qref: &[f32] = if qbuf.is_empty() { q } else { &qbuf };
+
+        // choose lists
+        let probe = self.select_probe_lists(qref);
         let refine = self.params.refine.max(k);
 
-        // rank centroids for probing
-        let mut cands: Vec<(usize, f32)> = Vec::with_capacity(self.centroids.len());
-        for (i, c) in self.centroids.iter().enumerate() {
-            let s = match self.header.metric { Metric::L2 => -metric::l2_distance(q, c), Metric::Cosine => metric::cosine_sim(q, c) };
-            cands.push((i, s));
-        }
-        cands.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
-        let probe: Vec<usize> = cands.into_iter().take(nprobe).map(|(i,_)| i).collect();
-
-        // gather
+        // gather candidates
         let mut scored: Vec<Hit> = Vec::new();
         for li in probe {
             let list = &self.lists[li];
@@ -185,16 +223,17 @@ impl IvfIndex {
                         if (tags[i] & mask) != mask { continue; }
                     } else { continue; }
                 }
-                let s = metric::score(self.header.metric, q, list.row(dim, i));
+                let s = metric::score(metric, qref, list.row(dim, i));
                 scored.push(Hit{ id: list.ids[i], score: s });
             }
         }
         if scored.is_empty() { return Vec::new(); }
+
         scored.sort_by(|a,b| b.score.partial_cmp(&a.score).unwrap().then(a.id.cmp(&b.id)));
         if scored.len() > refine { scored.truncate(refine); }
 
         // exact refine
-        let mut refine_flat = FlatIndex::new(dim, self.header.metric);
+        let mut refine_flat = FlatIndex::new(dim, metric);
         for h in &scored {
             for list in &self.lists {
                 if let Ok(pos) = list.ids.binary_search(&h.id) {
@@ -203,7 +242,7 @@ impl IvfIndex {
                 }
             }
         }
-        refine_flat.search(q, k)
+        refine_flat.search(qref, k)
     }
 
     #[inline]
@@ -224,82 +263,69 @@ impl IvfIndex {
         for list in &self.lists { h64(&mut h, list.ids.len() as u64); for id in &list.ids { h64(&mut h, *id); } }
         h
     }
-        pub fn search_parallel(&self, q: &[f32], k: usize, threads: usize) -> Vec<Hit> {
-            assert!(threads >= 1);
-            assert_eq!(q.len(), self.header.dim);
-            let dim = self.header.dim;
-            let metric = self.header.metric;
 
-            // choose probe lists
-            let nprobe = self.params.nprobe.min(self.centroids.len());
-            let mut cands: Vec<(usize, f32)> = (0..self.centroids.len())
-                .map(|i| {
-                    let s = match metric {
-                        Metric::L2 => -metric::l2_distance(q, &self.centroids[i]),
-                        Metric::Cosine => metric::cosine_sim(q, &self.centroids[i]),
-                    };
-                    (i, s)
-                })
-                .collect();
-            cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let probe: Vec<usize> = cands.into_iter().take(nprobe).map(|(i, _)| i).collect();
+    pub fn search_parallel(&self, q: &[f32], k: usize, threads: usize) -> Vec<Hit> {
+        assert!(threads >= 1);
+        assert_eq!(q.len(), self.header.dim);
+        let dim = self.header.dim;
+        let metric = self.header.metric;
 
-            if threads == 1 || probe.is_empty() {
-                return self.search(q, k);
-            }
+        // normalized query for Cosine
+        let qbuf = self.normalized_query(q);
+        let qref: &[f32] = if qbuf.is_empty() { q } else { &qbuf };
 
-            let t = threads.min(probe.len());
-            let chunk = (probe.len() + t - 1) / t;
-            let refine_total = self.params.refine.max(k);
-            let refine_each = ((refine_total + t - 1) / t).max(k);
+        // choose probe lists
+        let probe = self.select_probe_lists(qref);
+        if threads == 1 || probe.is_empty() { return self.search(qref, k); }
 
-            // collect partials deterministically by thread index
-            let mut partials: Vec<Vec<Hit>> = vec![Vec::new(); t];
+        let t = threads.min(probe.len());
+        let chunk = (probe.len() + t - 1) / t;
+        let refine_total = self.params.refine.max(k);
+        let refine_each = ((refine_total + t - 1) / t).max(k);
 
-            thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(t);
-                for ti in 0..t {
-                    let start = ti * chunk;
-                    let end = ((ti + 1) * chunk).min(probe.len());
-                    let lists: Vec<usize> = probe[start..end].to_vec();
+        // collect partials deterministically by thread index
+        let mut partials: Vec<Vec<Hit>> = vec![Vec::new(); t];
 
-                    handles.push(scope.spawn(move || -> (usize, Vec<Hit>) {
-                        let mut local: Vec<Hit> = Vec::new();
-                        for li in lists {
-                            let list = &self.lists[li]; // borrow is confined to scope
-                            for i in 0..list.len() {
-                                if list.tomb[i] != 0 { continue; }
-                                let s = metric::score(metric, q, list.row(dim, i));
-                                local.push(Hit { id: list.ids[i], score: s });
-                            }
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(t);
+            for ti in 0..t {
+                let start = ti * chunk;
+                let end = ((ti + 1) * chunk).min(probe.len());
+                let lists: Vec<usize> = probe[start..end].to_vec();
+
+                handles.push(scope.spawn(move || -> (usize, Vec<Hit>) {
+                    let mut local: Vec<Hit> = Vec::new();
+                    for li in lists {
+                        let list = &self.lists[li];
+                        for i in 0..list.len() {
+                            if list.tomb[i] != 0 { continue; }
+                            let s = metric::score(metric, qref, list.row(dim, i));
+                            local.push(Hit { id: list.ids[i], score: s });
                         }
-                        local.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap().then(a.id.cmp(&b.id)));
-                        if local.len() > refine_each { local.truncate(refine_each); }
-                        (ti, local)
-                    }));
-                }
-
-                // join BEFORE leaving the scope
-                for h in handles {
-                    let (ti, local) = h.join().unwrap();
-                    partials[ti] = local;
-                }
-            });
-
-            let mut approx: Vec<Hit> = partials.into_iter().flatten().collect();
-            approx.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap().then(a.id.cmp(&b.id)));
-            if approx.len() > refine_total { approx.truncate(refine_total); }
-
-            // exact re-rank
-            let mut refine_flat = FlatIndex::new(dim, metric);
-            for h in &approx {
-                for list in &self.lists {
-                    if let Ok(pos) = list.ids.binary_search(&h.id) {
-                        if list.tomb[pos] == 0 { refine_flat.add(h.id, list.row(dim, pos)); }
-                        break;
                     }
+                    local.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap().then(a.id.cmp(&b.id)));
+                    if local.len() > refine_each { local.truncate(refine_each); }
+                    (ti, local)
+                }));
+            }
+
+            for h in handles { let (ti, local) = h.join().unwrap(); partials[ti] = local; }
+        });
+
+        let mut approx: Vec<Hit> = partials.into_iter().flatten().collect();
+        approx.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap().then(a.id.cmp(&b.id)));
+        if approx.len() > refine_total { approx.truncate(refine_total); }
+
+        // exact re-rank
+        let mut refine_flat = FlatIndex::new(dim, metric);
+        for h in &approx {
+            for list in &self.lists {
+                if let Ok(pos) = list.ids.binary_search(&h.id) {
+                    if list.tomb[pos] == 0 { refine_flat.add(h.id, list.row(dim, pos)); }
+                    break;
                 }
             }
-            refine_flat.search(q, k)
         }
+        refine_flat.search(qref, k)
     }
+}

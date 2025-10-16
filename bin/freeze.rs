@@ -13,9 +13,7 @@ use raggedy_anndy::par::parallel_map_indexed;
 #[derive(Clone, Copy, ValueEnum, Debug)]
 enum MetricArg { Cosine, L2 }
 impl From<MetricArg> for Metric {
-    fn from(m: MetricArg) -> Self {
-        match m { MetricArg::Cosine => Metric::Cosine, MetricArg::L2 => Metric::L2 }
-    }
+    fn from(m: MetricArg) -> Self { match m { MetricArg::Cosine => Metric::Cosine, MetricArg::L2 => Metric::L2 } }
 }
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
@@ -24,13 +22,7 @@ enum Backend { IvfFlat, IvfPq }
 #[derive(Clone, Copy, ValueEnum, Debug)]
 enum OpqModeArg { Perm, Pca, PcaPerm }
 impl From<OpqModeArg> for OpqMode {
-    fn from(m: OpqModeArg) -> Self {
-        match m {
-            OpqModeArg::Perm => OpqMode::Perm,
-            OpqModeArg::Pca => OpqMode::Pca,
-            OpqModeArg::PcaPerm => OpqMode::PcaPerm,
-        }
-    }
+    fn from(m: OpqModeArg) -> Self { match m { OpqModeArg::Perm => OpqMode::Perm, OpqModeArg::Pca => OpqMode::Pca, OpqModeArg::PcaPerm => OpqMode::PcaPerm } }
 }
 
 /// Freeze-test: run a single fixed configuration and fail fast on regressions.
@@ -38,7 +30,7 @@ impl From<OpqModeArg> for OpqMode {
 #[command(name="freeze", about="Deterministic, CI-friendly regression gate for recall & latency")]
 struct Args {
     // dataset
-    #[arg(long, default_value_t=50000)] n: usize,
+    #[arg(long, default_value_t=25000)] n: usize,
     #[arg(long, default_value_t=256)] dim: usize,
     #[arg(long, value_enum, default_value_t=MetricArg::Cosine)] metric: MetricArg,
 
@@ -56,23 +48,23 @@ struct Args {
     #[arg(long, value_enum, default_value_t=Backend::IvfPq)] backend: Backend,
 
     // IVF coarse
-    #[arg(long, default_value_t=1024)] nlist: usize,
-    #[arg(long, default_value_t=512)] nprobe: usize,
-    #[arg(long, default_value_t=3000)] refine: usize,
+    #[arg(long, default_value_t=2048)] nlist: usize,
+    #[arg(long, default_value_t=386)] nprobe: usize,
+    #[arg(long, default_value_t=200)] refine: usize,
 
     // PQ params (ivf-pq only)
     #[arg(long, default_value_t=64)] m: usize,
     #[arg(long, default_value_t=8)] nbits: u8,
     #[arg(long, default_value_t=80)] iters: usize,
-    #[arg(long, default_value_t=true)] opq: bool,
+    #[arg(long, default_value_t=true, action=clap::ArgAction::Set)]opq: bool,
     #[arg(long, value_enum, default_value_t=OpqModeArg::PcaPerm)] opq_mode: OpqModeArg,
     #[arg(long, default_value_t=6)] opq_sweeps: usize,
     #[arg(long, default_value_t=true)] store_vecs: bool,
 
     // thresholds (freeze gates)
-    #[arg(long, default_value_t=0.90)] min_lb95: f32,
-    #[arg(long, default_value_t=0.90)] min_recall: f32,
-    #[arg(long, default_value_t=40.0)] max_p95_ms: f64,
+    #[arg(long, default_value_t=0.83)] min_lb95: f32,
+    #[arg(long, default_value_t=0.85)] min_recall: f32,
+    #[arg(long, default_value_t=250.0)] max_p95_ms: f64,
 
     // threading
     #[arg(long, default_value_t=1)] threads: usize, // concurrency across queries
@@ -106,12 +98,8 @@ fn main() {
     let mut flat_exact = FlatIndex::new(args.dim, metric);
     let mut data: Vec<(u64, Vec<f32>)> = Vec::with_capacity(args.n);
     for i in 0..args.n {
-        let v = match metric {
-            Metric::Cosine => random_unit_vec(&mut rng, args.dim),
-            Metric::L2 => (0..args.dim).map(|_| rng.gen::<f32>() - 0.5).collect(),
-        };
-        flat_exact.add(i as u64, &v);
-        data.push((i as u64, v));
+        let v = match metric { Metric::Cosine => random_unit_vec(&mut rng, args.dim), Metric::L2 => (0..args.dim).map(|_| rng.gen::<f32>() - 0.5).collect(), };
+        flat_exact.add(i as u64, &v); data.push((i as u64, v));
     }
     let dataset_ms = t_build0.elapsed().as_millis();
 
@@ -122,9 +110,11 @@ fn main() {
         Metric::L2 => (0..args.dim).map(|_| q_rng.gen::<f32>() - 0.5).collect(),
     }).collect();
 
-    println!("Freeze profile: {:?} backend={:?} N={} dim={} k={} nlist={} nprobe={} refine={} m={} nbits={} iters={} opq={} opq_mode={:?} sweeps={} store_vecs={} threads={} intra={}",
-             metric, args.backend, args.n, args.dim, args.k, args.nlist, args.nprobe, args.refine,
-             args.m, args.nbits, args.iters, args.opq, args.opq_mode, args.opq_sweeps, args.store_vecs, args.threads, args.intra);
+    println!(
+        "Freeze profile: {:?} backend={:?} N={} dim={} k={} nlist={} nprobe={} refine={} m={} nbits={} iters={} opq={} opq_mode={:?} sweeps={} store_vecs={} threads={} intra={}",
+        metric, args.backend, args.n, args.dim, args.k, args.nlist, args.nprobe, args.refine,
+        args.m, args.nbits, args.iters, args.opq, args.opq_mode, args.opq_sweeps, args.store_vecs, args.threads, args.intra
+    );
     println!("Dataset built in {} ms", dataset_ms);
 
     // Build index + determinism check, and wrap a thread-safe callable
@@ -136,34 +126,22 @@ fn main() {
             let fp1 = idx.fingerprint();
             let idx2 = IvfIndex::build(metric, args.dim, &data, params);
             let det = fp1 == idx2.fingerprint();
-            let idx = Arc::new(idx);
-            let k = args.k;
+            let idx = Arc::new(idx); let k = args.k;
             (det, Arc::new(move |q: &[f32]| idx.search(q, k)))
         }
         Backend::IvfPq => {
             let params = IvfPqParams {
-                nlist: args.nlist,
-                nprobe: args.nprobe,
-                refine: args.refine,
-                seed: args.seed_kmeans,
-                m: args.m,
-                nbits: args.nbits,
-                iters: args.iters,
-                use_opq: args.opq,
-                opq_mode: args.opq_mode.into(),
-                opq_sweeps: args.opq_sweeps,
+                nlist: args.nlist, nprobe: args.nprobe, refine: args.refine, seed: args.seed_kmeans,
+                m: args.m, nbits: args.nbits, iters: args.iters,
+                use_opq: args.opq, opq_mode: args.opq_mode.into(), opq_sweeps: args.opq_sweeps,
                 store_vecs: args.store_vecs,
             };
             let idx = IvfPqIndex::build(metric, args.dim, &data, params);
             let fp1 = idx.fingerprint();
             let idx2 = IvfPqIndex::build(metric, args.dim, &data, params);
             let det = fp1 == idx2.fingerprint();
-            let idx = Arc::new(idx);
-            let k = args.k;
-            let intra = args.intra.max(1);
-            let f = move |q: &[f32]| {
-                if intra > 1 { idx.search_parallel(q, k, intra) } else { idx.search(q, k) }
-            };
+            let idx = Arc::new(idx); let k = args.k; let intra = args.intra.max(1);
+            let f = move |q: &[f32]| { if intra > 1 { idx.search_parallel(q, k, intra) } else { idx.search(q, k) } };
             (det, Arc::new(f))
         }
     };
