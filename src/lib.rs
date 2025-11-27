@@ -23,6 +23,21 @@ pub mod pq;
 pub mod opq;
 pub mod ivfpq;
 pub mod par;
+pub mod context;
+pub mod time_index;
+pub use ivfpq::{IvfPqIndex, IvfPqParams};
+// src/lib.rs
+pub use context::{
+    ContextCfg,
+    ContextEncoder,
+    ContextKey,
+    QueryCtx,
+    TimeKey,
+    CTX_DIM,
+    TIME_DIM,
+};
+pub use time_index::{AnnIndex, TimedIndex};
+
 
 pub use metric::Metric;
 pub use types::{Hit, stable_top_k};

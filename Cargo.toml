@@ -27,6 +27,14 @@ path = "bin/build_index.rs"
 name = "ingest"
 path = "bin/ingest.rs"
 
+[[bin]]
+name = "context_test"
+path = "bin/context_test.rs"
+
+#[[bin]]
+#name = "entropy_eval"
+#path = "bin/entropy_eval.rs"
+
 [features]
 # Make optional deps activatable via features
 default = ["serde", "persist"]

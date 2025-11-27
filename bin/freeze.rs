@@ -53,7 +53,7 @@ impl From<OpqModeArg> for OpqMode {
 #[command(name = "freeze", about = "Deterministic, CI-friendly regression gate for recall & latency")]
 struct Args {
     // dataset
-    #[arg(long, default_value_t = 17500)]
+    #[arg(long, default_value_t = 20000)]
     n: usize,
     #[arg(long, default_value_t = 256)]
     dim: usize,
@@ -81,11 +81,11 @@ struct Args {
     backend: Backend,
 
     // IVF coarse
-    #[arg(long, default_value_t = 2560)]
+    #[arg(long, default_value_t = 3600)]
     nlist: usize,
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = 950)]
     nprobe: usize,
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 500)]
     refine: usize,
 
     // PQ params (ivf-pq only)
@@ -109,7 +109,7 @@ struct Args {
     min_lb95: f32,
     #[arg(long, default_value_t = 0.85)]
     min_recall: f32,
-    #[arg(long, default_value_t = 250.0)]
+    #[arg(long, default_value_t = 50.0)]
     max_p95_ms: f64,
     #[arg(long, default_value_t = 0.0)]
     max_p99_ms: f64, // 0 = disabled
