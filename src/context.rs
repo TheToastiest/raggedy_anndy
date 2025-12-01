@@ -4,8 +4,6 @@
 //! This replaces the old "entropy" concept. Nothing here mutates based on usage;
 //! vectors are purely a function of (semantic, context, absolute time).
 
-use std::hash::{Hash, Hasher};
-
 /// Dimensionality of the context subspace.
 pub const CTX_DIM: usize = 32;
 /// Dimensionality of the time subspace.
@@ -55,7 +53,6 @@ impl TimeKey {
     }
 }
 
-
 /// How a query anchors itself in time.
 /// Context bundle for a query.
 /// Time is already resolved by the caller (URIEL or your host app).
@@ -80,12 +77,11 @@ impl QueryCtx {
     }
 }
 
-
 /// Tunable scales for how much each subspace (semantic / context / time)
 /// bends the final geometry.
 #[derive(Clone, Debug)]
 pub struct ContextCfg {
-    /// Scale factor applied to the base semantic vector.
+    /// Scale factor applied to the *normalized* semantic vector.
     pub sem_scale: f32,
     /// Scale factor applied to the context subspace.
     pub ctx_scale: f32,
@@ -105,8 +101,9 @@ impl Default for ContextCfg {
 
 /// Encodes (semantic, context, time) into a single ANN-ready vector.
 ///
-/// IMPORTANT: This does *not* update with usage. Geometry is fixed at write time,
-/// and queries use the same mapping so past-context retrieval is symmetric.
+/// IMPORTANT:
+/// - `semantic` is expected to be approximately unit-norm (L2 ~= 1.0).
+/// - Geometry is fixed at write time; no usage-driven updates.
 #[derive(Clone, Debug)]
 pub struct ContextEncoder {
     cfg: ContextCfg,
@@ -122,6 +119,7 @@ impl ContextEncoder {
     }
 
     /// For *memory write*: semantic + context + absolute time.
+    /// `semantic` should be L2-normalized by the caller.
     pub fn encode_memory(
         &self,
         semantic: &[f32],
@@ -134,6 +132,7 @@ impl ContextEncoder {
     }
 
     /// For *query*: same mapping; time can be "now" or an explicit anchor.
+    /// `semantic_q` should be L2-normalized by the caller.
     pub fn encode_query(
         &self,
         semantic_q: &[f32],
@@ -143,7 +142,6 @@ impl ContextEncoder {
         let time_vec = encode_time(qctx.time.ts_s);
         combine(&self.cfg, semantic_q, &ctx_vec, &time_vec)
     }
-
 }
 
 // --- internal helpers -------------------------------------------------------
@@ -196,7 +194,6 @@ fn encode_time(ts_s: i64) -> [f32; TIME_DIM] {
     out
 }
 
-
 /// Concatenate subspaces, apply scales, then L2-normalize for ANN.
 ///
 /// Layout: [ semantic * sem_scale | ctx * ctx_scale | time * time_scale ]
@@ -206,6 +203,23 @@ fn combine(
     ctx: &[f32; CTX_DIM],
     time: &[f32; TIME_DIM],
 ) -> Vec<f32> {
+    // Debug safety: semantic should be approximately unit-norm.
+    #[cfg(debug_assertions)]
+    {
+        let mut sum_sq = 0.0f32;
+        for x in semantic.iter() {
+            sum_sq += x * x;
+        }
+        if sum_sq > 0.0 {
+            let norm = sum_sq.sqrt();
+            debug_assert!(
+                (norm - 1.0).abs() < 1e-2,
+                "ContextEncoder expects normalized semantic vectors (||v|| ~= 1.0); got norm={}",
+                norm
+            );
+        }
+    }
+
     let mut out = Vec::with_capacity(semantic.len() + CTX_DIM + TIME_DIM);
 
     out.extend(semantic.iter().map(|x| x * cfg.sem_scale));
@@ -227,7 +241,6 @@ fn hash_str(s: &str) -> u64 {
     }
     hash
 }
-
 
 fn l2_normalize_slice(v: &mut [f32]) {
     let mut sum_sq = 0.0f32;
@@ -266,7 +279,10 @@ mod tests {
 
     #[test]
     fn combined_vector_is_normalized() {
-        let sem = vec![0.1f32; 128];
+        let mut sem = vec![0.1f32; 128];
+        // normalize to satisfy debug assertion
+        super::l2_normalize_slice(&mut sem);
+
         let ctx_key = ContextKey::new(vec!["domain:rust"]);
         let t = TimeKey::from_unix(1_700_000_000);
         let enc = ContextEncoder::new(ContextCfg::default());
