@@ -4,7 +4,7 @@
 use crate::kmeans::kmeans_seeded;
 use crate::metric::Metric;
 
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize, Clone, Debug))]
 pub struct ProductQuantizer {
     pub d: usize,            // full dimension
     pub m: usize,            // number of sub-quantizers
@@ -29,22 +29,53 @@ impl ProductQuantizer {
     /// Train per-sub codebooks with k-means (L2) on residual training vectors in the *training space*.
     /// `train_rows` are full-dimensional residuals (len == d).
     pub fn train(&mut self, train_rows: &[Vec<f32>]) {
-        // collect subvectors per sub-quantizer
-        let mut per_sub: Vec<Vec<Vec<f32>>> = vec![Vec::new(); self.m];
-        for row in train_rows {
-            assert_eq!(row.len(), self.d);
+        let max_samples = 5000;
+        let n = train_rows.len();
+
+        // 1. Deterministic Selection of Training Subset
+        let subset: Vec<&Vec<f32>> = if n > max_samples {
+            // We use a deterministic stride to pick 5000 vectors across the whole range
+            // This is faster than a full shuffle and keeps the distribution stable.
+            let stride = n / max_samples;
+            (0..max_samples).map(|i| &train_rows[i * stride]).collect()
+        } else {
+            train_rows.iter().collect()
+        };
+
+        // 2. Transpose data into sub-quantizer chunks
+        let mut per_sub: Vec<Vec<Vec<f32>>> = vec![Vec::with_capacity(subset.len()); self.m];
+        for row in subset {
             for j in 0..self.m {
                 let s = j * self.dsub;
                 per_sub[j].push(row[s..s + self.dsub].to_vec());
             }
         }
-        // kmeans for each sub
-        for j in 0..self.m {
-            let centers = kmeans_seeded(&per_sub[j], self.k, Metric::L2, self.seed ^ (j as u64), self.iters);
-            let mut flat = Vec::with_capacity(self.k * self.dsub);
+
+        // 3. Parallelize the training of sub-quantizers
+        // Since each sub-quantizer is independent, we use your par.rs logic
+        use crate::par::parallel_map_indexed;
+
+        let m = self.m;
+        let k = self.k;
+        let iters = self.iters;
+        let seed = self.seed;
+        let dsub = self.dsub;
+
+        // We use a local parallel map to train all 64 quantizers across your 16 cores
+        let results = parallel_map_indexed(&per_sub, 12, |sub_data, j| {
+            let centers = kmeans_seeded(
+                sub_data,
+                k,
+                Metric::L2,
+                seed ^ (j as u64),
+                iters
+            );
+            let mut flat = Vec::with_capacity(k * dsub);
             for c in centers { flat.extend_from_slice(&c); }
-            self.codebooks[j] = flat;
-        }
+            flat
+        });
+
+        self.codebooks = results;
     }
 
     /// Encode a full vector into m codes (one per sub) using nearest L2 codeword in each sub.

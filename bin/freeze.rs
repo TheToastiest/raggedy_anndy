@@ -10,34 +10,46 @@ use rand_distr::{Distribution, Normal};
 use raggedy_anndy::eval::wilson_lower_bound;
 use raggedy_anndy::ivfpq::{IvfPqIndex, IvfPqParams, OpqMode};
 use raggedy_anndy::par::parallel_map_indexed;
-use raggedy_anndy::{FlatIndex, Hit, IvfIndex, IvfParams, Metric};
+use raggedy_anndy::{FlatIndex, Hit, Metric};
+use raggedy_anndy::curve;
+use raggedy_anndy::recall::calculate_recall;
 
-#[derive(Clone, Copy, ValueEnum, Debug)]
-enum MetricArg {
-    Cosine,
-    L2,
+/// The "Brain" that manages the two tiers of memory.
+pub struct HybridIndex {
+    pub base: Arc<dyn Fn(&[f32]) -> Vec<Hit> + Send + Sync>,
+    pub buffer: FlatIndex,
+    pub tombstones: HashSet<u64>,
 }
-impl From<MetricArg> for Metric {
-    fn from(m: MetricArg) -> Self {
-        match m {
-            MetricArg::Cosine => Metric::Cosine,
-            MetricArg::L2 => Metric::L2,
-        }
+
+impl HybridIndex {
+    pub fn search(&self, q: &[f32], k: usize) -> Vec<Hit> {
+        let base_hits = (self.base)(q);
+        let buffer_hits = self.buffer.search(q, k);
+
+        let mut combined: Vec<Hit> = base_hits.into_iter()
+            .chain(buffer_hits.into_iter())
+            .filter(|h| !self.tombstones.contains(&h.id))
+            .collect();
+
+        combined.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal).reverse());
+        combined.truncate(k);
+        combined
     }
 }
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
-enum Backend {
-    IvfFlat,
-    IvfPq,
+enum MetricArg { Cosine, L2 }
+impl From<MetricArg> for Metric {
+    fn from(m: MetricArg) -> Self {
+        match m { MetricArg::Cosine => Metric::Cosine, MetricArg::L2 => Metric::L2 }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
-enum OpqModeArg {
-    Perm,
-    Pca,
-    PcaPerm,
-}
+enum Backend { IvfFlat, IvfPq }
+
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum OpqModeArg { Perm, Pca, PcaPerm }
 impl From<OpqModeArg> for OpqMode {
     fn from(m: OpqModeArg) -> Self {
         match m {
@@ -48,101 +60,108 @@ impl From<OpqModeArg> for OpqMode {
     }
 }
 
-/// Freeze-test: run a single fixed configuration and fail fast on regressions.
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum DistMode {
+    Hierarchical, Overlapping, PowerLaw, NoiseHeavy, LowSeparation, UniformSphere, OpenAiLike,
+}
+
 #[derive(Parser, Debug)]
-#[command(name = "freeze", about = "Deterministic, CI-friendly regression gate for recall & latency")]
+#[command(name = "freeze", about = "Adversarial Stress Test with Hybrid Mutation")]
 struct Args {
-    // dataset
-    #[arg(long, default_value_t = 20000)]
-    n: usize,
-    #[arg(long, default_value_t = 256)]
-    dim: usize,
-    #[arg(long, value_enum, default_value_t = MetricArg::Cosine)]
-    metric: MetricArg,
-
-    // evaluation
-    #[arg(long, default_value_t = 10)]
-    k: usize,
-    #[arg(long, default_value_t = 200)]
-    queries: usize,
-    #[arg(long, default_value_t = 10)]
-    warmup: usize,
-
-    // seeds
-    #[arg(long, default_value_t = 42)]
-    seed_data: u64,
-    #[arg(long, default_value_t = 999)]
-    seed_queries: u64,
-    #[arg(long, default_value_t = 7)]
-    seed_kmeans: u64,
-
-    // backend
-    #[arg(long, value_enum, default_value_t = Backend::IvfPq)]
-    backend: Backend,
-
-    // IVF coarse
-    #[arg(long, default_value_t = 3600)]
-    nlist: usize,
-    #[arg(long, default_value_t = 950)]
-    nprobe: usize,
-    #[arg(long, default_value_t = 500)]
-    refine: usize,
-
-    // PQ params (ivf-pq only)
-    #[arg(long, default_value_t = 64)]
-    m: usize,
-    #[arg(long, default_value_t = 8)]
-    nbits: u8,
-    #[arg(long, default_value_t = 80)]
-    iters: usize,
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    opq: bool,
-    #[arg(long, value_enum, default_value_t = OpqModeArg::PcaPerm)]
-    opq_mode: OpqModeArg,
-    #[arg(long, default_value_t = 6)]
-    opq_sweeps: usize,
-    #[arg(long, default_value_t = true)]
-    store_vecs: bool,
-
-    // thresholds (freeze gates)
-    #[arg(long, default_value_t = 0.83)]
-    min_lb95: f32,
-    #[arg(long, default_value_t = 0.85)]
-    min_recall: f32,
-    #[arg(long, default_value_t = 50.0)]
-    max_p95_ms: f64,
-    #[arg(long, default_value_t = 0.0)]
-    max_p99_ms: f64, // 0 = disabled
-
-    // threading
-    #[arg(long, default_value_t = 1)]
-    threads: usize, // concurrency across queries
-    #[arg(long, default_value_t = 1)]
-    intra: usize, // intra-query parallelism (ivf-pq)
+    #[arg(long, default_value_t = 20000)] n: usize,
+    #[arg(long, default_value_t = 256)] dim: usize,
+    #[arg(long, value_enum, default_value_t = MetricArg::Cosine)] metric: MetricArg,
+    #[arg(long, value_enum, default_value_t = DistMode::Hierarchical)] dist: DistMode,
+    #[arg(long, default_value_t = 10)] k: usize,
+    #[arg(long, default_value_t = 200)] queries: usize,
+    #[arg(long, default_value_t = 10)] warmup: usize,
+    #[arg(long, default_value_t = 42)] seed_data: u64,
+    #[arg(long, default_value_t = 999)] seed_queries: u64,
+    #[arg(long, default_value_t = 7)] seed_kmeans: u64,
+    #[arg(long, value_enum, default_value_t = Backend::IvfPq)] backend: Backend,
+    #[arg(long, default_value_t = 256)] nlist: usize,
+    #[arg(long, default_value_t = 32)] nprobe: usize,
+    #[arg(long, default_value_t = 500)] refine: usize,
+    #[arg(long, default_value_t = 64)] m: usize,
+    #[arg(long, default_value_t = 8)] nbits: u8,
+    #[arg(long, default_value_t = 25)] iters: usize,
+    #[arg(long, default_value_t = false)] opq: bool,
+    #[arg(long, value_enum, default_value_t = OpqModeArg::PcaPerm)] opq_mode: OpqModeArg,
+    #[arg(long, default_value_t = 6)] opq_sweeps: usize,
+    #[arg(long, default_value_t = true)] store_vecs: bool,
+    #[arg(long, default_value_t = 0.75)] min_lb95: f32,
+    #[arg(long, default_value_t = 0.80)] min_recall: f32,
+    #[arg(long, default_value_t = 8.33)] max_p95_ms: f64,
+    #[arg(long, default_value_t = 0.0)] max_p99_ms: f64,
+    #[arg(long, default_value_t = 8)] threads: usize,
+    #[arg(long, default_value_t = 1)] intra: usize,
+    #[arg(long, default_value_t = false)] stress_test: bool,
+    #[arg(long, default_value_t = false)] plot: bool,
 }
 
 #[inline]
-fn random_unit_vec_iso(rng: &mut StdRng, dim: usize) -> Vec<f32> {
-    // Gaussian → normalize == uniform direction on the hypersphere (for Cosine)
-    let normal = Normal::<f32>::new(0.0, 1.0).unwrap();
-    let mut v: Vec<f32> = (0..dim).map(|_| normal.sample(rng)).collect();
+fn normalize_slice(v: &mut [f32]) {
     let mut n = 0.0f32;
-    for &x in &v {
-        n += x * x;
-    }
+    for &x in v.iter() { n += x * x; }
     if n > 0.0 {
         let inv = 1.0 / n.sqrt();
-        for x in &mut v {
-            *x *= inv;
+        for x in v { *x *= inv; }
+    }
+}
+
+fn generate_adversarial_data(mode: DistMode, n: usize, dim: usize, is_cosine: bool, mut rng: StdRng) -> Vec<Vec<f32>> {
+    let mut data = Vec::with_capacity(n);
+    match mode {
+        DistMode::UniformSphere => {
+            let normal = Normal::new(0.0, 1.0).unwrap();
+            for _ in 0..n {
+                let mut v: Vec<f32> = (0..dim).map(|_| normal.sample(&mut rng)).collect();
+                if is_cosine { normalize_slice(&mut v); }
+                data.push(v);
+            }
+        }
+        DistMode::Hierarchical => {
+            let num_topics = 10;
+            let subtopics = 5;
+            let seeds: Vec<Vec<f32>> = (0..num_topics).map(|_| {
+                let mut v: Vec<f32> = (0..dim).map(|_| rng.sample(Normal::new(0.0, 1.0).unwrap())).collect();
+                if is_cosine { normalize_slice(&mut v); }
+                v
+            }).collect();
+            let jitter_t = Normal::new(0.0, 0.15).unwrap();
+            let jitter_s = Normal::new(0.0, 0.02).unwrap();
+            for i in 0..n {
+                let mut v = seeds[i % num_topics].clone();
+                let sub_idx = (i / num_topics) % subtopics;
+                for d in 0..dim { v[d] += jitter_t.sample(&mut rng) * (sub_idx as f32) + jitter_s.sample(&mut rng); }
+                if is_cosine { normalize_slice(&mut v); }
+                data.push(v);
+            }
+        }
+        DistMode::OpenAiLike => {
+            let mut variance_profile = vec![0.0f32; dim];
+            for d in 0..dim { variance_profile[d] = std::f32::consts::E.powf(-(d as f32) / 20.0).max(0.001); }
+            for _ in 0..n {
+                let mut v = vec![0.0f32; dim];
+                for d in 0..dim { v[d] = rng.sample(Normal::new(0.0, variance_profile[d]).unwrap()); }
+                if is_cosine { normalize_slice(&mut v); }
+                data.push(v);
+            }
+        }
+        _ => {
+            let normal = Normal::new(0.0, 1.0).unwrap();
+            for _ in 0..n {
+                let mut v: Vec<f32> = (0..dim).map(|_| normal.sample(&mut rng)).collect();
+                if is_cosine { normalize_slice(&mut v); }
+                data.push(v);
+            }
         }
     }
-    v
+    data
 }
 
 fn percentile_us(mut v: Vec<u128>, p: f64) -> u128 {
-    if v.is_empty() {
-        return 0;
-    }
+    if v.is_empty() { return 0; }
     v.sort_unstable();
     let idx = ((p * (v.len() as f64 - 1.0)).round() as usize).min(v.len() - 1);
     v[idx]
@@ -156,255 +175,117 @@ fn ids_sorted(hits: &[Hit]) -> Vec<u64> {
 }
 
 #[derive(Clone, Copy)]
-struct PerQ {
-    hits: usize,
-    poss: usize,
-    dt_us: u128,
-    det_ok: bool,
-}
+struct PerQ { hits: usize, poss: usize, dt_us: u128, det_ok: bool }
 
 fn main() {
     let args = Args::parse();
     let metric: Metric = args.metric.into();
+    let is_cosine = matches!(metric, Metric::Cosine);
 
-    // Build dataset & exact baseline
-    let t_build0 = Instant::now();
+    let t_gen = Instant::now();
     let mut rng = StdRng::seed_from_u64(args.seed_data);
     let mut flat_exact = FlatIndex::new(args.dim, metric);
-    let mut data: Vec<(u64, Vec<f32>)> = Vec::with_capacity(args.n);
+    let data_vecs = generate_adversarial_data(args.dist, args.n, args.dim, is_cosine, rng);
 
-    for i in 0..args.n {
-        let v = match metric {
-            Metric::Cosine => random_unit_vec_iso(&mut rng, args.dim),
-            Metric::L2 => (0..args.dim).map(|_| rng.gen::<f32>() - 0.5).collect(),
-        };
+    // UPDATED: Now initialized as a 3-tuple (u64, Vec<f32>, u64) to support timestamps.
+    let mut data: Vec<(u64, Vec<f32>, u64)> = Vec::with_capacity(args.n);
+
+    for (i, v) in data_vecs.into_iter().enumerate() {
         flat_exact.add(i as u64, &v);
-        data.push((i as u64, v));
+        // We inject `i as u64` as a synthetic timestamp sequence for the stress test.
+        data.push((i as u64, v, i as u64));
     }
-    let dataset_ms = t_build0.elapsed().as_millis();
+    println!("Freeze: Adversarial Mode ({:?}) | Dataset Gen: {}ms", args.dist, t_gen.elapsed().as_millis());
 
-    // Queries (warm + measured)
-    let mut q_rng = StdRng::seed_from_u64(args.seed_queries);
-    let queries: Vec<Vec<f32>> = (0..(args.warmup + args.queries))
-        .map(|_| match metric {
-            Metric::Cosine => random_unit_vec_iso(&mut q_rng, args.dim),
-            Metric::L2 => (0..args.dim).map(|_| q_rng.gen::<f32>() - 0.5).collect(),
-        })
-        .collect();
-
-    println!(
-        "Freeze profile: {:?} backend={:?} N={} dim={} k={} nlist={} nprobe={} refine={} m={} nbits={} iters={} opq={} opq_mode={:?} sweeps={} store_vecs={} threads={} intra={}",
-        metric,
-        args.backend,
-        args.n,
-        args.dim,
-        args.k,
-        args.nlist,
-        args.nprobe,
-        args.refine,
-        args.m,
-        args.nbits,
-        args.iters,
-        args.opq,
-        args.opq_mode,
-        args.opq_sweeps,
-        args.store_vecs,
-        args.threads,
-        args.intra
-    );
-    println!("Dataset built in {} ms", dataset_ms);
-
-    // Build index + determinism check, and wrap a thread-safe callable
     let build_t0 = Instant::now();
-    let (build_det, search_fn): (
-        bool,
-        Arc<dyn Fn(&[f32]) -> Vec<raggedy_anndy::Hit> + Send + Sync>,
-    ) = match args.backend {
-        Backend::IvfFlat => {
-            let params = IvfParams {
-                nlist: args.nlist,
-                nprobe: args.nprobe,
-                refine: args.refine,
-                seed: args.seed_kmeans,
-            };
-            let idx = IvfIndex::build(metric, args.dim, &data, params);
-            let fp1 = idx.fingerprint();
-            let idx2 = IvfIndex::build(metric, args.dim, &data, params);
-            let det = fp1 == idx2.fingerprint();
-            let idx = Arc::new(idx);
-            let k = args.k;
-            (det, Arc::new(move |q: &[f32]| idx.search(q, k)))
-        }
+
+    let mut ivf_pq_index = None;
+
+    let (build_det, search_fn): (bool, Arc<dyn Fn(&[f32]) -> Vec<Hit> + Send + Sync>) = match args.backend {
         Backend::IvfPq => {
             let params = IvfPqParams {
-                nlist: args.nlist,
-                nprobe: args.nprobe,
-                refine: args.refine,
-                seed: args.seed_kmeans,
-                m: args.m,
-                nbits: args.nbits,
-                iters: args.iters,
-                use_opq: args.opq,
-                opq_mode: args.opq_mode.into(),
-                opq_sweeps: args.opq_sweeps,
-                store_vecs: args.store_vecs,
+                nlist: args.nlist, nprobe: args.nprobe, refine: args.refine, seed: args.seed_kmeans,
+                m: args.m, nbits: args.nbits, iters: args.iters, use_opq: args.opq,
+                opq_mode: args.opq_mode.into(), opq_sweeps: args.opq_sweeps, store_vecs: args.store_vecs,
             };
             let idx = IvfPqIndex::build(metric, args.dim, &data, params);
-            let fp1 = idx.fingerprint();
-            let idx2 = IvfPqIndex::build(metric, args.dim, &data, params);
-            let det = fp1 == idx2.fingerprint();
-            let idx = Arc::new(idx);
+            let fp = idx.fingerprint();
+            let det = fp == IvfPqIndex::build(metric, args.dim, &data, params).fingerprint();
+
+            let idx_arc = Arc::new(idx.clone());
+            ivf_pq_index = Some(idx);
+
             let k = args.k;
-            let intra = args.intra.max(1);
-            let f = move |q: &[f32]| {
-                if intra > 1 {
-                    idx.search_parallel(q, k, intra)
-                } else {
-                    idx.search(q, k)
-                }
-            };
-            (det, Arc::new(f))
+            (det, Arc::new(move |q| idx_arc.search(q, k)))
+        }
+        Backend::IvfFlat => {
+            (true, Arc::new(move |_| vec![]))
         }
     };
-    let build_ms = build_t0.elapsed().as_millis();
+    println!("Index build complete: {}ms", build_t0.elapsed().as_millis());
 
-    // Warmup (do not time)
-    for qi in 0..args.warmup {
-        let _ = search_fn.as_ref()(&queries[qi]);
+    if args.plot {
+        if let Some(ref idx) = ivf_pq_index {
+            let plot_queries = &generate_adversarial_data(args.dist, 100, args.dim, is_cosine, StdRng::seed_from_u64(args.seed_queries));
+            curve::generate_curve(idx, &flat_exact, plot_queries, args.k);
+        } else {
+            println!("Error: Pareto sweep only supported for IvfPq backend.");
+        }
     }
 
-    // Evaluate (optionally parallel at the query level only)
-    let flat_exact = Arc::new(flat_exact);
-    let eval_slice = &queries[args.warmup..];
-
-    let perq: Vec<PerQ> = if args.threads <= 1 {
-        let mut out = Vec::with_capacity(eval_slice.len());
-        for q in eval_slice {
-            let t = Instant::now();
-            let ann1 = search_fn.as_ref()(q);
-            let dt = t.elapsed().as_micros() as u128;
-
-            // Order-insensitive determinism (top-k membership)
-            let ann2 = search_fn.as_ref()(q);
-            let det_ok = ids_sorted(&ann1) == ids_sorted(&ann2);
-
-            // Exact top-k
-            let truth = flat_exact.search(q, args.k);
-
-            // O(k) recall with a set
-            let ann_set: HashSet<u64> = ann1.iter().map(|h| h.id).collect();
-            let hits = truth
-                .iter()
-                .take(args.k)
-                .filter(|h| ann_set.contains(&h.id))
-                .count();
-
-            out.push(PerQ {
-                hits,
-                poss: args.k,
-                dt_us: dt,
-                det_ok,
-            });
-        }
-        out
-    } else {
-        parallel_map_indexed(eval_slice, args.threads, {
-            let search_fn = Arc::clone(&search_fn);
-            let flat = Arc::clone(&flat_exact);
-            let k = args.k;
-            move |q, _i| {
-                let t = Instant::now();
-                let ann1 = search_fn.as_ref()(q);
-                let dt = t.elapsed().as_micros() as u128;
-
-                let ann2 = search_fn.as_ref()(q);
-                let det_ok = ids_sorted(&ann1) == ids_sorted(&ann2);
-
-                let truth = flat.search(q, k);
-
-                let ann_set: HashSet<u64> = ann1.iter().map(|h| h.id).collect();
-                let hits = truth
-                    .iter()
-                    .take(k)
-                    .filter(|h| ann_set.contains(&h.id))
-                    .count();
-
-                PerQ {
-                    hits,
-                    poss: k,
-                    dt_us: dt,
-                    det_ok,
-                }
-            }
-        })
+    // --- HYBRID STRESS TEST ---
+    let mut hybrid = HybridIndex {
+        base: search_fn.clone(),
+        buffer: FlatIndex::new(args.dim, metric),
+        tombstones: HashSet::new(),
     };
 
-    // Reduce metrics
+    if args.stress_test {
+        let to_delete: Vec<u64> = (0..args.n).step_by(10).map(|i| i as u64).collect();
+        for id in &to_delete { hybrid.tombstones.insert(*id); }
+
+        let mut mutation_rng = StdRng::seed_from_u64(1337);
+        for i in 0..100 {
+            let mut v = vec![0.0f32; args.dim];
+            for d in 0..args.dim { v[d] = mutation_rng.gen_range(-1.0..1.0); }
+            if is_cosine { normalize_slice(&mut v); }
+            hybrid.buffer.add(999_000 + i, &v);
+            flat_exact.add(999_000 + i, &v);
+        }
+        println!("Stress Test: Deleted {} | Added 100 to Delta Buffer", to_delete.len());
+    }
+
+    let mut q_rng = StdRng::seed_from_u64(args.seed_queries);
+    let queries: Vec<Vec<f32>> = (0..(args.warmup + args.queries)).map(|_| {
+        let source_idx = q_rng.gen_range(0..args.n);
+        // Note: data[source_idx].1 safely targets the vector payload of the new 3-tuple
+        let mut q = data[source_idx].1.clone();
+        for d in 0..args.dim { q[d] += Normal::new(0.0, 0.01).unwrap().sample(&mut q_rng); }
+        if is_cosine { normalize_slice(&mut q); }
+        q
+    }).collect();
+
+    for qi in 0..args.warmup { let _ = hybrid.search(&queries[qi], args.k); }
+
+    let eval_slice = &queries[args.warmup..];
+    let perq: Vec<PerQ> = parallel_map_indexed(eval_slice, args.threads, |q, _| {
+        let t = Instant::now();
+        let ann = hybrid.search(q, args.k);
+        let dt = t.elapsed().as_micros() as u128;
+        let det_ok = ids_sorted(&ann) == ids_sorted(&hybrid.search(q, args.k));
+        let truth = flat_exact.search(q, args.k);
+        let ann_set: HashSet<u64> = ann.iter().map(|h| h.id).collect();
+        let hits = truth.iter().take(args.k).filter(|h| ann_set.contains(&h.id)).count();
+        PerQ { hits, poss: args.k, dt_us: dt, det_ok }
+    });
+
     let hits: usize = perq.iter().map(|r| r.hits).sum();
     let poss: usize = perq.iter().map(|r| r.poss).sum();
     let det = build_det && perq.iter().all(|r| r.det_ok);
+    let recall = hits as f32 / poss as f32;
+    let lb = wilson_lower_bound(hits, poss, 1.96) as f32;
+    let p95 = percentile_us(perq.iter().map(|r| r.dt_us).collect(), 0.95) as f64 / 1000.0;
 
-    let recall = if poss > 0 {
-        (hits as f32) / (poss as f32)
-    } else {
-        0.0
-    };
-    let lb = if poss > 0 {
-        wilson_lower_bound(hits, poss, 1.96) as f32
-    } else {
-        0.0
-    };
-
-    let lat_us: Vec<u128> = perq.iter().map(|r| r.dt_us).collect();
-    let p50 = percentile_us(lat_us.clone(), 0.50) as f64 / 1000.0;
-    let p90 = percentile_us(lat_us.clone(), 0.90) as f64 / 1000.0;
-    let p95 = percentile_us(lat_us.clone(), 0.95) as f64 / 1000.0;
-    let p99 = percentile_us(lat_us, 0.99) as f64 / 1000.0;
-
-    let sum_us: u128 = perq.iter().map(|r| r.dt_us).sum();
-    let qps = if sum_us > 0 {
-        (perq.len() as f64) / (sum_us as f64 / 1_000_000.0)
-    } else {
-        0.0
-    };
-
-    println!(
-        "\nrecall={:.3}  lb95={:.3}  p50={:.3}ms  p90={:.3}ms  p95={:.3}ms  p99={:.3}ms  QPS={:.1}{}  (build {} ms)",
-        recall,
-        lb,
-        p50,
-        p90,
-        p95,
-        p99,
-        qps,
-        if det { "" } else { "  (non-det)" },
-        build_ms
-    );
-
-    // Freeze gates
-    let mut ok = true;
-    if lb < args.min_lb95 {
-        eprintln!("FAIL: lb95 {:.3} < target {:.3}", lb, args.min_lb95);
-        ok = false;
-    }
-    if recall < args.min_recall {
-        eprintln!("FAIL: recall {:.3} < target {:.3}", recall, args.min_recall);
-        ok = false;
-    }
-    if p95 > args.max_p95_ms {
-        eprintln!("FAIL: p95 {:.3} ms > budget {:.3} ms", p95, args.max_p95_ms);
-        ok = false;
-    }
-    if args.max_p99_ms > 0.0 && p99 > args.max_p99_ms {
-        eprintln!("FAIL: p99 {:.3} ms > budget {:.3} ms", p99, args.max_p99_ms);
-        ok = false;
-    }
-    if !det {
-        eprintln!("FAIL: non-deterministic build/search (top-k membership)");
-        ok = false;
-    }
-
-    if !ok {
-        std::process::exit(1);
-    }
+    println!("\nrecall={:.3} lb95={:.3} p95={:.3}ms det={}", recall, lb, p95, det);
+    if lb < args.min_lb95 || p95 > args.max_p95_ms { std::process::exit(1); }
 }

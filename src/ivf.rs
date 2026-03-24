@@ -204,16 +204,19 @@ impl IvfIndex {
         let dim = self.header.dim;
         let metric = self.header.metric;
 
-        // Use normalized query for Cosine
+        // Use normalized query for Cosine.
+        // Note: The caller should ideally pass a normalized query to avoid this allocation.
         let qbuf = self.normalized_query(q);
         let qref: &[f32] = if qbuf.is_empty() { q } else { &qbuf };
 
-        // choose lists
+        // 1. Choose lists
         let probe = self.select_probe_lists(qref);
-        let refine = self.params.refine.max(k);
 
-        // gather candidates
-        let mut scored: Vec<Hit> = Vec::new();
+        // 2. Gather and Score
+        // We over-allocate slightly to prevent resizing during the loop
+        let estimated_capacity = probe.len() * (self.header.params.nlist.max(1));
+        let mut exact_hits: Vec<Hit> = Vec::with_capacity(estimated_capacity.min(1000));
+
         for li in probe {
             let list = &self.lists[li];
             for i in 0..list.len() {
@@ -223,31 +226,86 @@ impl IvfIndex {
                         if (tags[i] & mask) != mask { continue; }
                     } else { continue; }
                 }
+
+                // Because ListFlat stores the exact vectors, this IS the exact score.
                 let s = metric::score(metric, qref, list.row(dim, i));
-                scored.push(Hit{ id: list.ids[i], score: s });
+                exact_hits.push(Hit{ id: list.ids[i], score: s });
             }
         }
-        if scored.is_empty() { return Vec::new(); }
 
-        scored.sort_by(|a,b| b.score.partial_cmp(&a.score).unwrap().then(a.id.cmp(&b.id)));
-        if scored.len() > refine { scored.truncate(refine); }
+        if exact_hits.is_empty() { return Vec::new(); }
 
-        // exact refine
-        let mut refine_flat = FlatIndex::new(dim, metric);
-        for h in &scored {
-            for list in &self.lists {
-                if let Ok(pos) = list.ids.binary_search(&h.id) {
-                    if list.tomb[pos] == 0 { refine_flat.add(h.id, list.row(dim, pos)); }
-                    break;
-                }
-            }
-        }
-        refine_flat.search(qref, k)
+        // 3. Sort and Truncate (No FlatIndex refinement needed!)
+        exact_hits.sort_unstable_by(|a,b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(a.id.cmp(&b.id)));
+        exact_hits.truncate(k);
+
+        exact_hits
     }
 
     #[inline]
     pub fn search(&self, q: &[f32], k: usize) -> Vec<Hit> { self.search_with_filter(q, k, None) }
 
+    pub fn search_parallel(&self, q: &[f32], k: usize, threads: usize) -> Vec<Hit> {
+        assert!(threads >= 1);
+        assert_eq!(q.len(), self.header.dim);
+        let dim = self.header.dim;
+        let metric = self.header.metric;
+
+        let qbuf = self.normalized_query(q);
+        let qref: &[f32] = if qbuf.is_empty() { q } else { &qbuf };
+
+        let probe = self.select_probe_lists(qref);
+        if threads == 1 || probe.is_empty() { return self.search(qref, k); }
+
+        let t = threads.min(probe.len());
+        let chunk = (probe.len() + t - 1) / t;
+
+        // We only need 'k' hits per thread, because we don't need a massive
+        // pool for a secondary refinement step.
+        let k_each = k;
+
+        let mut partials: Vec<Vec<Hit>> = vec![Vec::new(); t];
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(t);
+            for ti in 0..t {
+                let start = ti * chunk;
+                let end = ((ti + 1) * chunk).min(probe.len());
+                let lists: Vec<usize> = probe[start..end].to_vec();
+
+                handles.push(scope.spawn(move || -> (usize, Vec<Hit>) {
+                    let mut local: Vec<Hit> = Vec::with_capacity(k_each * 2);
+                    for li in lists {
+                        let list = &self.lists[li];
+                        for i in 0..list.len() {
+                            if list.tomb[i] != 0 { continue; }
+
+                            // Calculate exact score
+                            let s = metric::score(metric, qref, list.row(dim, i));
+                            local.push(Hit { id: list.ids[i], score: s });
+                        }
+                    }
+
+                    // Local sort and truncate to k
+                    local.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(a.id.cmp(&b.id)));
+                    if local.len() > k_each { local.truncate(k_each); }
+                    (ti, local)
+                }));
+            }
+
+            for h in handles {
+                let (ti, local) = h.join().unwrap();
+                partials[ti] = local;
+            }
+        });
+
+        // Global Merge
+        let mut final_hits: Vec<Hit> = partials.into_iter().flatten().collect();
+        final_hits.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(a.id.cmp(&b.id)));
+        final_hits.truncate(k);
+
+        final_hits
+    }
     /// Deterministic build fingerprint (FNV-1a over header+centroids+ids).
     pub fn fingerprint(&self) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
@@ -262,70 +320,5 @@ impl IvfIndex {
         for c in &self.centroids { for &f in c { hf(&mut h, f); } }
         for list in &self.lists { h64(&mut h, list.ids.len() as u64); for id in &list.ids { h64(&mut h, *id); } }
         h
-    }
-
-    pub fn search_parallel(&self, q: &[f32], k: usize, threads: usize) -> Vec<Hit> {
-        assert!(threads >= 1);
-        assert_eq!(q.len(), self.header.dim);
-        let dim = self.header.dim;
-        let metric = self.header.metric;
-
-        // normalized query for Cosine
-        let qbuf = self.normalized_query(q);
-        let qref: &[f32] = if qbuf.is_empty() { q } else { &qbuf };
-
-        // choose probe lists
-        let probe = self.select_probe_lists(qref);
-        if threads == 1 || probe.is_empty() { return self.search(qref, k); }
-
-        let t = threads.min(probe.len());
-        let chunk = (probe.len() + t - 1) / t;
-        let refine_total = self.params.refine.max(k);
-        let refine_each = ((refine_total + t - 1) / t).max(k);
-
-        // collect partials deterministically by thread index
-        let mut partials: Vec<Vec<Hit>> = vec![Vec::new(); t];
-
-        thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(t);
-            for ti in 0..t {
-                let start = ti * chunk;
-                let end = ((ti + 1) * chunk).min(probe.len());
-                let lists: Vec<usize> = probe[start..end].to_vec();
-
-                handles.push(scope.spawn(move || -> (usize, Vec<Hit>) {
-                    let mut local: Vec<Hit> = Vec::new();
-                    for li in lists {
-                        let list = &self.lists[li];
-                        for i in 0..list.len() {
-                            if list.tomb[i] != 0 { continue; }
-                            let s = metric::score(metric, qref, list.row(dim, i));
-                            local.push(Hit { id: list.ids[i], score: s });
-                        }
-                    }
-                    local.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap().then(a.id.cmp(&b.id)));
-                    if local.len() > refine_each { local.truncate(refine_each); }
-                    (ti, local)
-                }));
-            }
-
-            for h in handles { let (ti, local) = h.join().unwrap(); partials[ti] = local; }
-        });
-
-        let mut approx: Vec<Hit> = partials.into_iter().flatten().collect();
-        approx.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap().then(a.id.cmp(&b.id)));
-        if approx.len() > refine_total { approx.truncate(refine_total); }
-
-        // exact re-rank
-        let mut refine_flat = FlatIndex::new(dim, metric);
-        for h in &approx {
-            for list in &self.lists {
-                if let Ok(pos) = list.ids.binary_search(&h.id) {
-                    if list.tomb[pos] == 0 { refine_flat.add(h.id, list.row(dim, pos)); }
-                    break;
-                }
-            }
-        }
-        refine_flat.search(qref, k)
     }
 }

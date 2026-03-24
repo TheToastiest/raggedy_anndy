@@ -1,7 +1,10 @@
+// src/kmeans.rs
+
 use crate::metric::{self, Metric};
 use crate::seed::SplitMix64;
 
-/// Deterministic k‑means++ (fixed seed, fixed iteration cap, id‑based tie‑breaks).
+/// Deterministic k-means++ (fixed seed, fixed iteration cap, id-based tie-breaks).
+/// Uses a flat memory layout to prevent allocator thrashing during the build phase.
 pub fn kmeans_seeded(
     data: &[Vec<f32>],
     k: usize,
@@ -10,97 +13,133 @@ pub fn kmeans_seeded(
     max_iters: usize,
 ) -> Vec<Vec<f32>> {
     assert!(k > 0 && k <= data.len());
+    let n = data.len();
     let dim = data[0].len();
     for v in data { assert_eq!(v.len(), dim); }
 
     let mut rng = SplitMix64::new(seed);
-    let n = data.len();
 
-    // --- init: first center by seeded pick (not data‑dependent randomness)
+    // --- 1. Init: K-Means++ Seeding ---
+    // We use a flat array for centroids: index `c * dim + d`
+    let mut centers = vec![0.0f32; k * dim];
     let first = rng.gen_range(n);
-    let mut centers: Vec<Vec<f32>> = vec![data[first].to_vec()];
-    let mut nearest: Vec<(usize, f64)> = vec![(0, std::f64::INFINITY); n];
+    centers[0..dim].copy_from_slice(&data[first]);
 
-    // --- k‑means++ seeding
-    while centers.len() < k {
-        // compute D(x)^2 to current nearest center
-        let last = centers.last().unwrap();
-        for i in 0..n {
-            // distance in f64 for numeric stability
-            let d = match metric {
-                Metric::L2 => metric::l2_distance(&data[i], last) as f64,
-                Metric::Cosine => 1.0 - metric::cosine_sim(&data[i], last) as f64,
-            };
-            let cur = nearest[i].1;
-            if d < cur { nearest[i] = (centers.len() - 1, d); }
-        }
+    let mut nearest: Vec<(usize, f64)> = vec![(0, f64::INFINITY); n];
+    let mut num_centers = 1;
+
+    while num_centers < k {
+        let last_c_idx = num_centers - 1;
+        let last_c = &centers[last_c_idx * dim .. (last_c_idx + 1) * dim];
+
         let mut sum = 0.0f64;
-        for (_, d) in &nearest { sum += (*d) * (*d); }
-        // select next center via deterministic weighted sampling
+        for i in 0..n {
+            // Note: If metric is Cosine, data should already be L2-normalized
+            // by the caller (IvfIndex::build), so L2 distance here effectively
+            // performs Spherical K-Means.
+            let d = match metric {
+                Metric::L2 => metric::l2_distance(&data[i], last_c) as f64,
+                Metric::Cosine => 1.0 - metric::cosine_sim(&data[i], last_c) as f64,
+            };
+            if d < nearest[i].1 { nearest[i] = (last_c_idx, d); }
+            sum += nearest[i].1 * nearest[i].1;
+        }
+
         let mut r = rng.next_f64() * sum;
         let mut idx = 0usize;
         for i in 0..n {
             let w = nearest[i].1 * nearest[i].1;
             if r <= w { idx = i; break; } else { r -= w; }
         }
-        centers.push(data[idx].to_vec());
+
+        let offset = num_centers * dim;
+        centers[offset .. offset + dim].copy_from_slice(&data[idx]);
+        num_centers += 1;
     }
 
-    // --- Lloyd iterations
-    let mut assign: Vec<usize> = vec![0; n];
-    for _ in 0..max_iters {
-        // Assign
+    // --- 2. Lloyd Iterations (Zero-Allocation Hot Loop) ---
+    let mut assign = vec![usize::MAX; n];
+    let mut new_centers = vec![0.0f32; k * dim];
+    let mut counts = vec![0usize; k];
+
+    for _iter in 0..max_iters {
+        let mut changes = 0;
+
+        // Step A: Assign vectors to nearest centroid
         for i in 0..n {
             let mut best_c = 0usize;
-            let mut best_d = std::f64::INFINITY;
-            for (c, center) in centers.iter().enumerate() {
-                let d = match metric {
-                    Metric::L2 => metric::l2_distance(&data[i], center) as f64,
-                    Metric::Cosine => 1.0 - metric::cosine_sim(&data[i], center) as f64,
-                };
-                if d < best_d || (d == best_d && c < best_c) {
-                    best_d = d; best_c = c;
-                }
-            }
-            assign[i] = best_c;
-        }
-        // Update
-        let mut new_centers = vec![vec![0.0f32; dim]; k];
-        if metric == Metric::Cosine {
+            let mut best_d = f64::INFINITY;
+
             for c in 0..k {
-                let mut n = 0.0f32;
-                for d in 0..dim { n += new_centers[c][d] * new_centers[c][d]; }
-                if n > 0.0 {
-                    let inv = n.sqrt().recip();
-                    for d in 0..dim { new_centers[c][d] *= inv; }
+                let c_vec = &centers[c * dim .. (c + 1) * dim];
+                let d = match metric {
+                    Metric::L2 => metric::l2_distance(&data[i], c_vec) as f64,
+                    Metric::Cosine => 1.0 - metric::cosine_sim(&data[i], c_vec) as f64,
+                };
+
+                if d < best_d {
+                    best_d = d;
+                    best_c = c;
                 }
             }
+
+            if assign[i] != best_c {
+                assign[i] = best_c;
+                changes += 1;
+            }
         }
-        let mut counts = vec![0usize; k];
+
+        // Convergence Check: If nothing moved, we are done.
+        if changes == 0 { break; }
+
+        // Step B: Update Centroids
+        new_centers.fill(0.0);
+        counts.fill(0);
+
         for i in 0..n {
-            let c = assign[i]; counts[c] += 1;
-            for d in 0..dim { new_centers[c][d] += data[i][d]; }
+            let c = assign[i];
+            counts[c] += 1;
+            let offset = c * dim;
+            for d in 0..dim {
+                new_centers[offset + d] += data[i][d];
+            }
         }
+
+        // Step C: Average and Normalize
         for c in 0..k {
+            let offset = c * dim;
+            let c_vec = &mut new_centers[offset .. offset + dim];
+
             if counts[c] > 0 {
                 let inv = 1.0f32 / (counts[c] as f32);
-                for d in 0..dim { new_centers[c][d] *= inv; }
+                for d in 0..dim { c_vec[d] *= inv; }
+
+                // If Cosine, re-normalize the centroid back to the unit sphere
+                if metric == Metric::Cosine {
+                    let mut n_len = 0.0f32;
+                    for d in 0..dim { n_len += c_vec[d] * c_vec[d]; }
+                    if n_len > 0.0 {
+                        let n_inv = n_len.sqrt().recip();
+                        for d in 0..dim { c_vec[d] *= n_inv; }
+                    }
+                }
             } else {
-                // empty cluster: re‑seed deterministically
-                let idx = c % n; new_centers[c] = data[idx].to_vec();
+                // Empty cluster logic: pull a deterministic vector from data
+                let fallback_idx = (c * 17) % n;
+                c_vec.copy_from_slice(&data[fallback_idx]);
             }
         }
-        if almost_eq_mat(&centers, &new_centers) { break; }
-        centers = new_centers;
+
+        // Swap buffers
+        centers.copy_from_slice(&new_centers);
     }
 
-    centers
-}
-
-fn almost_eq_mat(a: &Vec<Vec<f32>>, b: &Vec<Vec<f32>>) -> bool {
-    if a.len() != b.len() || a[0].len() != b[0].len() { return false; }
-    for i in 0..a.len() { for j in 0..a[0].len() {
-        if (a[i][j] - b[i][j]).abs() > 1e-6 { return false; }
-    }}
-    true
+    // --- 3. Output Translation ---
+    // Convert flat buffer back to Vec<Vec<f32>> for API compatibility
+    let mut out = Vec::with_capacity(k);
+    for c in 0..k {
+        let offset = c * dim;
+        out.push(centers[offset .. offset + dim].to_vec());
+    }
+    out
 }

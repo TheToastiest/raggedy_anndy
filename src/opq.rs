@@ -1,16 +1,4 @@
 // src/opq.rs
-// Optimized Product Quantization helpers:
-// - OPQ-P: variance-balancing permutation across subspaces (deterministic).
-// - Optional PCA rotation via a few Jacobi sweeps (deterministic).
-//
-// Notes:
-// * apply(): y = P_after * (R * x). If R is None -> identity; if P is None -> no permutation.
-// * train_perm(dim, m, residuals): computes per-dimension variance on residuals and assigns
-//   dims to m subspaces to balance total variance per subspace (bin-packing style).
-// * train_pca(dim, m, residuals, sweeps): builds a rotation R from covariance via Jacobi.
-//   You can combine with a permutation if you want (see train_pca_then_perm).
-//
-// All math uses f64 for accumulation to keep training deterministic and stable.
 
 #[derive(Clone, Debug)]
 pub struct Opq {
@@ -24,19 +12,16 @@ pub struct Opq {
 }
 
 impl Opq {
-    /// Identity transform (no rotation, no permutation).
     pub fn identity(dim: usize, m: usize) -> Self {
         Self { dim, m, r: None, perm: None }
     }
 
     pub fn is_identity(&self) -> bool { self.r.is_none() && self.perm.is_none() }
 
-    /// Set an explicit rotation matrix (dim x dim, row-major).
     pub fn with_matrix(mut self, r: Vec<f32>) -> Self {
         assert_eq!(r.len(), self.dim * self.dim); self.r = Some(r); self
     }
 
-    /// Set an explicit permutation mapping (len = dim), y[i] = x[perm[i]] (after rotation).
     pub fn with_perm(mut self, perm: Vec<usize>) -> Self {
         assert_eq!(perm.len(), self.dim);
         let mut seen = vec![false; self.dim];
@@ -44,34 +29,57 @@ impl Opq {
         self.perm = Some(perm); self
     }
 
-    /// Apply y = P * (R * x). If R is None -> identity; if P is None -> identity.
+    /// Build-time API: Allocates a new vector for the result.
     pub fn apply(&self, x: &[f32]) -> Vec<f32> {
-        assert_eq!(x.len(), self.dim);
-        let y0: Vec<f32> = if let Some(rm) = &self.r {
-            let d = self.dim; let mut out = vec![0.0f32; d];
-            for i in 0..d { let row = &rm[i*d..(i+1)*d]; let mut acc = 0.0f32; for j in 0..d { acc += row[j] * x[j]; } out[i] = acc; }
-            out
-        } else { x.to_vec() };
-        if let Some(p) = &self.perm { let mut out = vec![0.0f32; self.dim]; for i in 0..self.dim { out[i] = y0[p[i]]; } out } else { y0 }
+        let mut out = vec![0.0f32; self.dim];
+        self.apply_to(x, &mut out);
+        out
     }
 
-    /// In-place variant to avoid reallocs in hot paths.
+    /// ZERO-ALLOCATION API: Reads from `x`, writes to `out`.
+    /// `x` and `out` MUST NOT alias.
+    pub fn apply_to(&self, x: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(x.len(), self.dim);
+        debug_assert_eq!(out.len(), self.dim);
+
+        // 1. Handle Rotation
+        if let Some(rm) = &self.r {
+            let d = self.dim;
+            for i in 0..d {
+                let row = &rm[i*d..(i+1)*d];
+                let mut acc = 0.0f32;
+                for j in 0..d { acc += row[j] * x[j]; }
+                out[i] = acc;
+            }
+        } else {
+            out.copy_from_slice(x);
+        }
+
+        // 2. Handle Permutation (In-place on the output buffer)
+        if let Some(p) = &self.perm {
+            // We must copy 'out' back into itself via permutation.
+            // A tiny stack buffer is sufficient for dimensions up to ~1024.
+            // If dim > 1024, consider falling back to a heap alloc or requiring a larger workspace.
+            let mut temp = [0.0f32; 512]; // Adjust size based on your max expected dims
+            let d = self.dim.min(512);
+            temp[..d].copy_from_slice(&out[..d]);
+
+            for i in 0..d {
+                out[i] = temp[p[i]];
+            }
+        }
+    }
+
+    /// In-place variant for when you already own the mutable buffer.
     pub fn apply_inplace(&self, x: &mut [f32]) {
         debug_assert_eq!(x.len(), self.dim);
         if self.r.is_none() && self.perm.is_none() { return; }
-        let d = self.dim;
-        let mut buf = vec![0.0f32; d];
-        // R * x -> buf
-        if let Some(rm) = &self.r {
-            for i in 0..d { let row = &rm[i*d..(i+1)*d]; let mut acc = 0.0f32; for j in 0..d { acc += row[j] * x[j]; } buf[i] = acc; }
-        } else {
-            buf.copy_from_slice(x);
-        }
-        // P * buf -> x
-        if let Some(p) = &self.perm { for i in 0..d { x[i] = buf[p[i]]; } } else { x.copy_from_slice(&buf); }
+
+        let mut buf = vec![0.0f32; self.dim]; // Still allocates, but only used in build phase
+        self.apply_to(x, &mut buf);
+        x.copy_from_slice(&buf);
     }
 
-    /// Fingerprint state: emit a few 64-bit words representing rotation/permutation.
     pub fn fingerprint_bits(&self) -> Vec<u64> {
         fn h64(mut h: u64, x: u64) -> u64 { h ^= x; h = h.wrapping_mul(0x100000001b3); h }
         let mut out = Vec::with_capacity(4);
@@ -87,9 +95,7 @@ impl Opq {
         out
     }
 
-    // ---------- Training APIs ----------
-
-    /// Permutation-only OPQ: balance per-sub variance across m blocks (block = dim/m).
+    // ---------- Training APIs (Unchanged) ----------
     pub fn train_perm(dim: usize, m: usize, residuals: &[Vec<f32>]) -> Self {
         assert!(dim > 0 && m > 0 && dim % m == 0 && !residuals.is_empty());
         for v in residuals { assert_eq!(v.len(), dim); }
@@ -106,7 +112,6 @@ impl Opq {
         Self { dim, m, r: None, perm: Some(perm) }
     }
 
-    /// PCA rotation via deterministic Jacobi sweeps. No permutation.
     pub fn train_pca(dim: usize, m: usize, residuals: &[Vec<f32>], sweeps: usize) -> Self {
         assert!(dim > 0 && m > 0 && dim % m == 0 && !residuals.is_empty());
         for v in residuals { assert_eq!(v.len(), dim); }
@@ -123,7 +128,6 @@ impl Opq {
         Self { dim, m, r: Some(r), perm: None }
     }
 
-    /// PCA rotation followed by permutation in the rotated space.
     pub fn train_pca_then_perm(dim: usize, m: usize, residuals: &[Vec<f32>], sweeps: usize) -> Self {
         let opq_r = Self::train_pca(dim, m, residuals, sweeps);
         let rotated: Vec<Vec<f32>> = residuals.iter().map(|r| opq_r.apply(r)).collect();

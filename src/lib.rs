@@ -25,6 +25,8 @@ pub mod ivfpq;
 pub mod par;
 pub mod context;
 pub mod time_index;
+pub mod recall;
+pub mod curve;
 pub use ivfpq::{IvfPqIndex, IvfPqParams};
 // src/lib.rs
 pub use context::{

@@ -4,7 +4,7 @@
 name = "raggedy_anndy"
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "RiftForged Proprietary"
 description = "Deterministic ANN + RAG building blocks (Flat, IVF-Flat)"
 
 [[bin]]
@@ -14,6 +14,10 @@ path = "bin/freeze.rs"
 #[[bin]]
 #name = "raggedy_anndy"
 #path = "bin/rn_ui.rs"
+
+[[bin]]
+name = "combat_load"
+path = "bin/combat_load.rs"
 
 [[bin]]
 name = "sweep"
@@ -56,6 +60,6 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 thiserror = "2.0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-
+crossbeam = "0.8.4"
 [dev-dependencies]
 proptest = "1"
