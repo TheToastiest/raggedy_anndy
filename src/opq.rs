@@ -57,12 +57,12 @@ impl Opq {
 
         // 2. Handle Permutation (In-place on the output buffer)
         if let Some(p) = &self.perm {
-            // We must copy 'out' back into itself via permutation.
-            // A tiny stack buffer is sufficient for dimensions up to ~1024.
-            // If dim > 1024, consider falling back to a heap alloc or requiring a larger workspace.
-            let mut temp = [0.0f32; 512]; // Adjust size based on your max expected dims
-            let d = self.dim.min(512);
-            temp[..d].copy_from_slice(&out[..d]);
+            // Permute through a scratch copy: stack for dim <= 512, heap above (never truncate).
+            let d = self.dim;
+            let mut stack = [0.0f32; 512];
+            let mut heap = Vec::new();
+            let temp: &mut [f32] = if d <= 512 { &mut stack[..d] } else { heap.resize(d, 0.0); &mut heap[..] };
+            temp.copy_from_slice(&out[..d]);
 
             for i in 0..d {
                 out[i] = temp[p[i]];
@@ -154,4 +154,19 @@ fn jacobi_eigen_symmetric(a_in: &[f64], dim: usize, sweeps: usize) -> (Vec<f64>,
     }
     for i in 0..n { lambda[i] = a[i*n + i]; }
     (u, lambda)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permutation_covers_every_dim_above_512() {
+        let dim = 520;
+        let perm: Vec<usize> = (0..dim).rev().collect();
+        let opq = Opq::identity(dim, 8).with_perm(perm);
+        let x: Vec<f32> = (0..dim).map(|i| i as f32).collect();
+        let y = opq.apply(&x);
+        let expect: Vec<f32> = (0..dim).rev().map(|i| i as f32).collect();
+        assert_eq!(y, expect);
+    }
 }
