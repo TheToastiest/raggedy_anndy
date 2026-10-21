@@ -23,8 +23,8 @@
 //! `#[ignore = "SLOW ..."]`; run them with
 //!     cargo test --release --test gates -- --ignored --test-threads=1
 //! Recall passes in all six cells on master @ 3a25945 (tightest: N=10k k=10,
-//! held-out lb95 0.9586). Latency passes at 10k and 100k and fails at 1M;
-//! the 1M latency tests are `KNOWN-FAIL` (numbers under "cells" below).
+//! held-out lb95 0.9586). Latency passes in all six since search scores 4
+//! rows per kernel call (numbers under "cells" below).
 
 mod common;
 use common::*;
@@ -223,14 +223,17 @@ fn gate(n: usize, k: usize, which: Gate) {
 }
 
 // ------------------------------------------------------------------ cells
-// Recall and latency are separate tests so the passing recall gates keep
-// running while latency is a known failure. Measured on master @ 3a25945,
-// 4-core container, release, 2 lookups/tick (query p95 / tick p95):
-//   10k  k5   522 us / 1088 us     10k  k10   506 us / 1066 us
-//   100k k5   585 us /  873 us     100k k10   570 us /  935 us
-//   1M   k5  1451 us / 2767 us     1M   k10  1472 us / 3107 us
-// Run to run, 10k/100k query p95 ranged 506-779 us and tick p95 873-1308 us
-// across two passes, so those cells have roughly 25-35% headroom.
+// Recall and latency are separate tests so a latency regression does not
+// hide recall results. 4-core container, release, 2 lookups/tick
+// (query p95 / tick p95):
+//            master @ 3a25945        4-row kernels (this branch)
+//   10k  k5   522 us / 1088 us        263 us /  636 us
+//   10k  k10  506 us / 1066 us        310 us /  506 us
+//   100k k5   585 us /  873 us        256 us /  572 us
+//   100k k10  570 us /  935 us        320 us /  552 us
+//   1M   k5  1451 us / 2767 us        643 us / 1324 us
+//   1M   k10 1472 us / 3107 us        666 us / 1212 us
+// Results (ids and score bits) are unchanged: tests/search_equivalence.rs.
 
 #[test] fn recall_n10k_k5() { gate(10_000, 5, Gate::Recall); }
 #[test] fn recall_n10k_k10() { gate(10_000, 10, Gate::Recall); }
@@ -266,11 +269,11 @@ fn latency_n100k_k5() { gate(100_000, 5, Gate::Latency); }
 fn latency_n100k_k10() { gate(100_000, 10, Gate::Latency); }
 
 #[test]
-#[ignore = "KNOWN-FAIL + SLOW: query p95 1451us > 1000us, tick p95 2767us"]
+#[ignore = "SLOW: 1M build (~2 min) + exact truth, ~2.5 GB RAM"]
 fn latency_n1m_k5() { gate(1_000_000, 5, Gate::Latency); }
 
 #[test]
-#[ignore = "KNOWN-FAIL + SLOW: query p95 1472us > 1000us, tick p95 3107us"]
+#[ignore = "SLOW: 1M build (~2 min) + exact truth, ~2.5 GB RAM"]
 fn latency_n1m_k10() { gate(1_000_000, 10, Gate::Latency); }
 
 // ------------------------------------------------------------------ helpers
@@ -301,5 +304,72 @@ fn sweep_search_params() {
             let (_, p95) = latency_us(&idx, &f.held_out, K_MAX);
             eprintln!("N={n} nlist={nlist} nprobe={np:4} refine={rf:5} held-out={h:.4} near={nr:.4} p95={p95:.0}us");
         }
+    }
+}
+
+/// Profiling aid, not a gate: for the N in RA_SWEEP_N (default 1M), prints
+/// list-size spread, rows scanned per query, and where search time goes,
+/// by replaying the search phases over the index's public data with the
+/// same kernels `IvfPqIndex::search_temporal` uses (rerank here is scalar).
+#[test]
+#[ignore = "profiling aid: RA_SWEEP_N=1000000 cargo test --release --test gates profile -- --ignored --nocapture"]
+fn profile_search_phases() {
+    use raggedy_anndy::metric;
+    let n: usize = std::env::var("RA_SWEEP_N").ok().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(n);
+    let idx = &f.index;
+    let mut lens: Vec<usize> = idx.lists.iter().map(|l| l.len()).collect();
+    lens.sort();
+    let pct = |v: &[usize], p: f64| v[((p * v.len() as f64).ceil() as usize).clamp(1, v.len()) - 1];
+    eprintln!("lists={} len min={} p50={} p95={} max={}", lens.len(), lens[0], pct(&lens, 0.5), pct(&lens, 0.95), lens[lens.len() - 1]);
+
+    let (nprobe, m, k) = (idx.params.nprobe, idx.params.m, 10usize);
+    let (mut t_coarse, mut t_lut, mut t_scan, mut t_sel, mut t_rerank) = (vec![], vec![], vec![], vec![], vec![]);
+    let mut scanned = vec![];
+    for i in 0..f.timing.ids.len() {
+        let mut q = row(&f.timing, i).to_vec(); normalize(&mut q);
+        let t0 = Instant::now();
+        let mut probe: Vec<(usize, f32)> = Vec::with_capacity(idx.centroids.len());
+        for (b, c) in idx.centroids.chunks(4).enumerate() {
+            if c.len() == 4 {
+                let s = metric::dot_x4(&q, [&c[0][..], &c[1][..], &c[2][..], &c[3][..]]);
+                for t in 0..4 { probe.push((b * 4 + t, s[t])); }
+            } else { for (t, cc) in c.iter().enumerate() { probe.push((b * 4 + t, metric::dot(&q, cc))); } }
+        }
+        probe.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        probe.truncate(nprobe);
+        let t1 = Instant::now();
+        let lut = idx.pq.adc_lut_ip(&q);
+        let t2 = Instant::now();
+        let mut approx: Vec<(f32, u64, usize, usize)> = Vec::new();
+        let mut sums = Vec::new();
+        for &(li, cs) in &probe {
+            let l = &idx.lists[li];
+            sums.resize(l.len(), 0.0);
+            idx.pq.adc_sum_rows(&lut, &l.codes[..l.len() * m], &mut sums);
+            for r in 0..l.len() {
+                if l.tomb[r] == 1 { continue; }
+                approx.push((cs + sums[r], l.ids[r], li, r));
+            }
+        }
+        let t3 = Instant::now();
+        scanned.push(approx.len());
+        let keep = idx.params.refine.max(k);
+        if approx.len() > keep { approx.select_nth_unstable_by(keep - 1, |a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))); approx.truncate(keep); }
+        let t4 = Instant::now();
+        let hits: Vec<Hit> = approx.iter().map(|&(_, id, li, r)| Hit { id, score: metric::dot(&q, idx.lists[li].vec_row(DIM, r)) }).collect();
+        std::hint::black_box(raggedy_anndy::stable_top_k(hits, k));
+        let t5 = Instant::now();
+        for (v, a, b) in [(&mut t_coarse, t0, t1), (&mut t_lut, t1, t2), (&mut t_scan, t2, t3), (&mut t_sel, t3, t4), (&mut t_rerank, t4, t5)] {
+            v.push((b - a).as_secs_f64() * 1e6);
+        }
+    }
+    scanned.sort();
+    eprintln!("rows scanned/query p50={} p95={} max={}", pct(&scanned, 0.5), pct(&scanned, 0.95), scanned[scanned.len() - 1]);
+    for (name, mut v) in [("coarse", t_coarse), ("lut", t_lut), ("scan", t_scan), ("select", t_sel), ("rerank", t_rerank)] {
+        v.sort_by(|a, b| a.total_cmp(b));
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        eprintln!("{name:7} mean={mean:7.1}us p50={:7.1}us p95={:7.1}us", percentile_us(&v, 0.5), percentile_us(&v, 0.95));
     }
 }
