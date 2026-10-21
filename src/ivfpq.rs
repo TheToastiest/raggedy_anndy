@@ -173,7 +173,9 @@ impl IvfPqIndex {
     }
 
     /// Primary search API injected with native temporal decay math.
+    /// A query with any NaN or infinite component has no usable score and returns no hits.
     pub fn search_temporal(&self, q: &[f32], k: usize, required_tag: Option<u64>, current_time: u64, lambda: f32) -> Vec<Hit> {
+        if q.iter().any(|x| !x.is_finite()) { return Vec::new(); }
         let dim = self.dim;
         let m = self.params.m;
         let cosine = matches!(self.metric, Metric::Cosine);
@@ -492,13 +494,17 @@ mod tests {
     }
 
     #[test]
-    fn nan_query_does_not_panic_and_ties_break_by_id() {
+    fn non_finite_query_returns_nothing_and_ties_break_by_id() {
         let dim = 8;
         let mut rows = sphere_rows(200, dim, 10);
         rows[150] = rows[3].clone(); // exact duplicate of id 3
         let idx = IvfPqIndex::build(Metric::Cosine, dim, &as_data(&rows), params(4, 4, 200, 2));
         let hits = idx.search(&rows[3], 2);
         assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![3, 150]);
-        let _ = idx.search(&vec![f32::NAN; dim], 5);
+        assert!(idx.search(&vec![f32::NAN; dim], 5).is_empty());
+        let mut one_nan = rows[3].clone(); one_nan[0] = f32::NAN;
+        assert!(idx.search(&one_nan, 5).is_empty());
+        let mut inf = rows[3].clone(); inf[1] = f32::INFINITY;
+        assert!(idx.search(&inf, 5).is_empty());
     }
 }
