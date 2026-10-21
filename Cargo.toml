@@ -50,7 +50,7 @@ rand_distr = "0.4"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 clap = { version = "4", features = ["derive"] }
-rand = "0.8" # only for test data generation
+rand = "0.8.6" # only for test data generation (>= 0.8.6: Dependabot, unsound with a custom logger)
 nalgebra = { version = "0.32", default-features = false, features = ["std"] }
 axum = { version = "0.7", features = ["macros", "multipart"] }
 http = "1.3.1"
