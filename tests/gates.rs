@@ -92,9 +92,7 @@ fn near_copies(ds: &Dataset, nq: usize, sigma: f32, seed: u64) -> Dataset {
 fn exact_truth(flat: &FlatIndex, qs: &Dataset) -> Vec<Vec<Hit>> {
     let idx: Vec<usize> = (0..qs.ids.len()).collect();
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    // FlatIndex::search truncates a Vec sized N, so each result keeps N*16 B
-    // of capacity; copy to an exact-size Vec or 1M x 800 queries is ~13 GB.
-    parallel_map_indexed(&idx, threads, |&i, _| flat.search(row(qs, i), K_MAX).to_vec())
+    parallel_map_indexed(&idx, threads, |&i, _| flat.search(row(qs, i), K_MAX))
 }
 
 fn build_fixture(n: usize) -> Fixture {
@@ -208,11 +206,11 @@ fn gate_n100k_k5() { gate(100_000, 5); }
 fn gate_n100k_k10() { gate(100_000, 10); }
 
 #[test]
-#[ignore = "SLOW: 1M build (~2 min) + exact truth, several GB RAM"]
+#[ignore = "SLOW: 1M build (~2 min) + exact truth, ~2.5 GB RAM"]
 fn gate_n1m_k5() { gate(1_000_000, 5); }
 
 #[test]
-#[ignore = "SLOW: 1M build (~2 min) + exact truth, several GB RAM"]
+#[ignore = "SLOW: 1M build (~2 min) + exact truth, ~2.5 GB RAM"]
 fn gate_n1m_k10() { gate(1_000_000, 10); }
 
 // ------------------------------------------------------------------ helpers

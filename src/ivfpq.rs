@@ -1,5 +1,5 @@
 use crate::metric::{self, Metric};
-use crate::types::Hit;
+use crate::types::{Hit, stable_top_k};
 #[cfg(test)]
 use crate::flat::FlatIndex;
 use crate::pq::ProductQuantizer;
@@ -222,7 +222,7 @@ impl IvfPqIndex {
             approx.truncate(keep);
         }
 
-        let mut hits: Vec<Hit> = if self.params.store_vecs {
+        let hits: Vec<Hit> = if self.params.store_vecs {
             approx.iter().map(|c| {
                 let v = self.lists[c.li].vec_row(dim, c.pos);
                 let s = if cosine { metric::dot(&q_eff, v) } else { -metric::l2_distance(&q_eff, v) };
@@ -231,9 +231,7 @@ impl IvfPqIndex {
         } else {
             approx.iter().map(|c| Hit { id: c.id, score: c.score }).collect()
         };
-        hits.sort_unstable_by(|a, b| by_score_then_id(a.score, a.id, b.score, b.id));
-        hits.truncate(k);
-        hits
+        stable_top_k(hits, k)
     }
 
     /// Legacy wrapper for the standard trait layout (zero decay)
