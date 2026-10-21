@@ -7,10 +7,7 @@ pub struct Hit { pub id: u64, pub score: f32 }
 pub fn stable_top_k(mut hits: Vec<Hit>, k: usize) -> Vec<Hit> {
     hits.sort_by(|a, b| {
         // score desc
-        match b.score.partial_cmp(&a.score).unwrap() {
-            std::cmp::Ordering::Equal => a.id.cmp(&b.id),
-            ord => ord,
-        }
+        b.score.total_cmp(&a.score).then(a.id.cmp(&b.id))
     });
     hits.truncate(k.min(hits.len()));
     hits

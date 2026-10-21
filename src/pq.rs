@@ -63,15 +63,19 @@ impl ProductQuantizer {
 
         // We use a local parallel map to train all 64 quantizers across your 16 cores
         let results = parallel_map_indexed(&per_sub, 12, |sub_data, j| {
+            // Fewer training rows than codewords: train what the data supports and pad by
+            // repeating the last codeword (encode picks the first nearest, so padding is never chosen).
+            let kc = k.min(sub_data.len());
             let centers = kmeans_seeded(
                 sub_data,
-                k,
+                kc,
                 Metric::L2,
                 seed ^ (j as u64),
                 iters
             );
             let mut flat = Vec::with_capacity(k * dsub);
-            for c in centers { flat.extend_from_slice(&c); }
+            for c in &centers { flat.extend_from_slice(c); }
+            for _ in kc..k { flat.extend_from_slice(&centers[kc - 1]); }
             flat
         });
 
