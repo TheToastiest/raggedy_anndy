@@ -201,6 +201,8 @@ impl IvfIndex {
     /// Search with optional required tag mask. A hit must satisfy (tags[id] & mask) == mask.
     pub fn search_with_filter(&self, q: &[f32], k: usize, required_tag: Option<u64>) -> Vec<Hit> {
         assert_eq!(q.len(), self.header.dim);
+        // A non-finite query has no usable value: return nothing.
+        if q.iter().any(|x| !x.is_finite()) { return Vec::new(); }
         let dim = self.header.dim;
         let metric = self.header.metric;
 
@@ -248,6 +250,7 @@ impl IvfIndex {
     pub fn search_parallel(&self, q: &[f32], k: usize, threads: usize) -> Vec<Hit> {
         assert!(threads >= 1);
         assert_eq!(q.len(), self.header.dim);
+        if q.iter().any(|x| !x.is_finite()) { return Vec::new(); }
         let dim = self.header.dim;
         let metric = self.header.metric;
 
@@ -255,7 +258,9 @@ impl IvfIndex {
         let qref: &[f32] = if qbuf.is_empty() { q } else { &qbuf };
 
         let probe = self.select_probe_lists(qref);
-        if threads == 1 || probe.is_empty() { return self.search(qref, k); }
+        // Pass the raw query: search() normalises it itself, and normalising
+        // twice changes the last bits of every score.
+        if threads == 1 || probe.is_empty() { return self.search(q, k); }
 
         let t = threads.min(probe.len());
         let chunk = (probe.len() + t - 1) / t;

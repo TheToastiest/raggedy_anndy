@@ -121,7 +121,6 @@ fn ivfpq_repeated_search_is_identical() {
 /// merge on them. threads=1 currently re-normalises an already-normalised
 /// query (search_parallel -> search), which shifts the last bits.
 #[test]
-#[ignore = "KNOWN-FAIL: IvfIndex::search_parallel(threads=1) normalises the query twice, scores differ in the last bits"]
 fn ivf_flat_search_parallel_matches_serial_for_any_thread_count() {
     let data = uniform_sphere(2_000, DIM, 42);
     let rows: Vec<(u64, Vec<f32>)> = (0..data.ids.len()).map(|i| (data.ids[i], row(&data, i).to_vec())).collect();
@@ -202,7 +201,6 @@ fn ivfpq_nan_query_returns_no_hits() {
 }
 
 #[test]
-#[ignore = "KNOWN-FAIL: FlatIndex::search ranks and returns rows with NaN scores instead of returning nothing"]
 fn flat_nan_query_returns_no_hits() {
     let flat = flat_from(&uniform_sphere(100, DIM, 1), Metric::Cosine);
     let r = catch_unwind(AssertUnwindSafe(|| flat.search(&nan_query(), 10)));
@@ -210,7 +208,6 @@ fn flat_nan_query_returns_no_hits() {
 }
 
 #[test]
-#[ignore = "KNOWN-FAIL: IvfIndex select_probe_lists uses partial_cmp(..).unwrap()"]
 fn ivf_flat_nan_query_returns_no_hits() {
     let data = uniform_sphere(500, DIM, 1);
     let rows: Vec<(u64, Vec<f32>)> = (0..data.ids.len()).map(|i| (data.ids[i], row(&data, i).to_vec())).collect();
