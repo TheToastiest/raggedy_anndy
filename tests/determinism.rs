@@ -187,26 +187,41 @@ fn flat_equal_scores_and_zero_query_are_ordered_by_ascending_id() {
 
 // ------------------------------------------------------------ odd input
 
-/// A NaN in a query (bad embedding, uninitialised buffer) must not take
-/// down the game server. What it should *return* is a separate decision;
-/// this only asserts no panic.
-#[test]
-#[ignore = "KNOWN-FAIL: partial_cmp(..).unwrap() panics on NaN (findings §3.3)"]
-fn ivfpq_nan_query_does_not_panic() {
-    let idx = build_fixture();
+/// A NaN in a query (bad embedding, uninitialised buffer) has no usable
+/// value, so search returns no hits. It must not panic and must not
+/// return arbitrary rows ranked on NaN scores. (Decided by Brinn,
+/// 2026-10-21.)
+fn nan_query() -> Vec<f32> {
     let mut q = vec![0.1f32; DIM];
     q[3] = f32::NAN;
-    let r = catch_unwind(AssertUnwindSafe(|| idx.search(&q, 10)));
-    assert!(r.is_ok(), "IvfPqIndex::search panicked on a NaN query");
+    q
+}
+
+#[test]
+#[ignore = "KNOWN-FAIL: partial_cmp(..).unwrap() panics on NaN (findings §3.3)"]
+fn ivfpq_nan_query_returns_no_hits() {
+    let idx = build_fixture();
+    let r = catch_unwind(AssertUnwindSafe(|| idx.search(&nan_query(), 10)));
+    assert_eq!(r.expect("IvfPqIndex::search panicked on a NaN query"), Vec::<Hit>::new());
 }
 
 #[test]
 #[ignore = "KNOWN-FAIL: stable_top_k uses partial_cmp(..).unwrap() (findings §3.3)"]
-fn flat_nan_query_does_not_panic() {
-    let data = uniform_sphere(100, DIM, 1);
-    let flat = flat_from(&data, Metric::Cosine);
-    let mut q = vec![0.1f32; DIM];
-    q[0] = f32::NAN;
-    let r = catch_unwind(AssertUnwindSafe(|| flat.search(&q, 10)));
-    assert!(r.is_ok(), "FlatIndex::search panicked on a NaN query");
+fn flat_nan_query_returns_no_hits() {
+    let flat = flat_from(&uniform_sphere(100, DIM, 1), Metric::Cosine);
+    let r = catch_unwind(AssertUnwindSafe(|| flat.search(&nan_query(), 10)));
+    assert_eq!(r.expect("FlatIndex::search panicked on a NaN query"), Vec::<Hit>::new());
+}
+
+#[test]
+#[ignore = "KNOWN-FAIL: IvfIndex select_probe_lists uses partial_cmp(..).unwrap()"]
+fn ivf_flat_nan_query_returns_no_hits() {
+    let data = uniform_sphere(500, DIM, 1);
+    let rows: Vec<(u64, Vec<f32>)> = (0..data.ids.len()).map(|i| (data.ids[i], row(&data, i).to_vec())).collect();
+    let ivf = IvfIndex::build(Metric::Cosine, DIM, &rows, IvfParams { nlist: 16, nprobe: 4, refine: 0, seed: 7 });
+    let q = nan_query();
+    let r = catch_unwind(AssertUnwindSafe(|| ivf.search(&q, 10)));
+    assert_eq!(r.expect("IvfIndex::search panicked on a NaN query"), Vec::<Hit>::new());
+    let r = catch_unwind(AssertUnwindSafe(|| ivf.search_parallel(&q, 10, 4)));
+    assert_eq!(r.expect("IvfIndex::search_parallel panicked on a NaN query"), Vec::<Hit>::new());
 }
