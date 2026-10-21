@@ -4,7 +4,7 @@
 //! (fresh draws, not noisy copies of stored rows) unless a test says
 //! otherwise, and ground truth is exact cosine top-k from FlatIndex.
 //!
-//! Tests marked `#[ignore = "KNOWN-FAIL ..."]` fail on master @ df23a59 and
+//! Tests marked `#[ignore = "KNOWN-FAIL ..."]` fail on master and
 //! document the target behaviour. Run them with:
 //!     cargo test --release --test recall -- --ignored
 //! When a fix makes one pass, delete its `#[ignore]` line in the same PR.
@@ -58,7 +58,6 @@ fn clustered_fixture() -> Fixture {
 /// true top-10 almost always. Today the cosine ADC score omits q·centroid,
 /// so rows from different lists are not comparable and this collapses.
 #[test]
-#[ignore = "KNOWN-FAIL: IVF-PQ cosine ADC drops the q·centroid term (findings §3.1)"]
 fn ivfpq_exhaustive_probe_recall_at_10_is_at_least_095_uniform_sphere() {
     let f = sphere_fixture();
     let t = ivfpq_recall(&f.index, &f.queries, &f.truth, K);
@@ -69,7 +68,6 @@ fn ivfpq_exhaustive_probe_recall_at_10_is_at_least_095_uniform_sphere() {
 }
 
 #[test]
-#[ignore = "KNOWN-FAIL: IVF-PQ cosine ADC drops the q·centroid term (findings §3.1)"]
 fn ivfpq_exhaustive_probe_recall_at_10_is_at_least_095_clustered() {
     let f = clustered_fixture();
     let t = ivfpq_recall(&f.index, &f.queries, &f.truth, K);
@@ -84,7 +82,6 @@ fn ivfpq_exhaustive_probe_recall_at_10_is_at_least_095_clustered() {
 /// recall may wobble by at most 1 point but must never drop further than
 /// that, and exhaustive probing must be the best (within that slack).
 #[test]
-#[ignore = "KNOWN-FAIL: recall drops as nprobe grows because ADC scores are not comparable across lists (findings §2)"]
 fn ivfpq_recall_does_not_drop_as_nprobe_grows() {
     let f = sphere_fixture();
     let sweep = [1usize, 2, 4, 8, 16, 32, 64];

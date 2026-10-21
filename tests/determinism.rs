@@ -2,7 +2,7 @@
 //! seed) regardless of machine core count, and search must order results
 //! by (score desc, id asc) with no panics on odd input.
 //!
-//! Tests marked `#[ignore = "KNOWN-FAIL ..."]` fail on master @ df23a59 and
+//! Tests marked `#[ignore = "KNOWN-FAIL ..."]` fail on master and
 //! document the target behaviour. Run them with:
 //!     cargo test --release --test determinism -- --ignored
 //! When a fix makes one pass, delete its `#[ignore]` line in the same PR.
@@ -52,7 +52,6 @@ fn child_print_ivfpq_build_digest() {
 /// the same index from the same snapshot.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "KNOWN-FAIL: IVF-PQ k-means reduction order depends on core count (findings §3.3)"]
 fn ivfpq_build_is_identical_on_1_core_and_all_cores() {
     use std::process::Command;
     let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
@@ -83,7 +82,6 @@ fn ivfpq_build_is_identical_on_1_core_and_all_cores() {
 /// fingerprint() is how callers check that two indexes are the same. It
 /// must cover everything search reads, not just list lengths.
 #[test]
-#[ignore = "KNOWN-FAIL: fingerprint() is XOR of list lengths only (findings §3.3)"]
 fn ivfpq_fingerprint_detects_any_build_state_change() {
     let base = build_fixture();
     let fp = base.fingerprint();
@@ -123,7 +121,6 @@ fn ivfpq_repeated_search_is_identical() {
 /// merge on them. threads=1 currently re-normalises an already-normalised
 /// query (search_parallel -> search), which shifts the last bits.
 #[test]
-#[ignore = "KNOWN-FAIL: IvfIndex::search_parallel(threads=1) normalises the query twice, scores differ in the last bits"]
 fn ivf_flat_search_parallel_matches_serial_for_any_thread_count() {
     let data = uniform_sphere(2_000, DIM, 42);
     let rows: Vec<(u64, Vec<f32>)> = (0..data.ids.len()).map(|i| (data.ids[i], row(&data, i).to_vec())).collect();
@@ -151,7 +148,6 @@ fn duplicate_rows(dim: usize) -> (Vec<f32>, Vec<(u64, Vec<f32>)>) {
 }
 
 #[test]
-#[ignore = "KNOWN-FAIL: IVF-PQ search uses sort_unstable_by with no id tie-break (findings §3.3)"]
 fn ivfpq_equal_scores_are_ordered_by_ascending_id() {
     let (q, rows) = duplicate_rows(DIM);
     let rows3: Vec<(u64, Vec<f32>, u64)> = rows.into_iter().map(|(id, v)| (id, v, 0)).collect();
@@ -198,7 +194,6 @@ fn nan_query() -> Vec<f32> {
 }
 
 #[test]
-#[ignore = "KNOWN-FAIL: partial_cmp(..).unwrap() panics on NaN (findings §3.3)"]
 fn ivfpq_nan_query_returns_no_hits() {
     let idx = build_fixture();
     let r = catch_unwind(AssertUnwindSafe(|| idx.search(&nan_query(), 10)));
@@ -206,7 +201,6 @@ fn ivfpq_nan_query_returns_no_hits() {
 }
 
 #[test]
-#[ignore = "KNOWN-FAIL: stable_top_k uses partial_cmp(..).unwrap() (findings §3.3)"]
 fn flat_nan_query_returns_no_hits() {
     let flat = flat_from(&uniform_sphere(100, DIM, 1), Metric::Cosine);
     let r = catch_unwind(AssertUnwindSafe(|| flat.search(&nan_query(), 10)));
@@ -214,7 +208,6 @@ fn flat_nan_query_returns_no_hits() {
 }
 
 #[test]
-#[ignore = "KNOWN-FAIL: IvfIndex select_probe_lists uses partial_cmp(..).unwrap()"]
 fn ivf_flat_nan_query_returns_no_hits() {
     let data = uniform_sphere(500, DIM, 1);
     let rows: Vec<(u64, Vec<f32>)> = (0..data.ids.len()).map(|i| (data.ids[i], row(&data, i).to_vec())).collect();

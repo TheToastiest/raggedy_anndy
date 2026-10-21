@@ -29,6 +29,8 @@ impl FlatIndex {
 
     pub fn search(&self, q: &[f32], k: usize) -> Vec<Hit> {
         assert_eq!(q.len(), self.dim);
+        // A non-finite query has no usable value: return nothing.
+        if q.iter().any(|x| !x.is_finite()) { return Vec::new(); }
         let mut hits = Vec::with_capacity(self.len());
         for i in 0..self.len() {
             let s = metric::score(self.metric, q, self.row(i));
