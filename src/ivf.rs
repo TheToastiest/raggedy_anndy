@@ -1,5 +1,5 @@
 use crate::metric::{self, Metric};
-use crate::types::Hit;
+use crate::types::{Hit, stable_top_k};
 use crate::flat::FlatIndex;
 use crate::kmeans::kmeans_seeded;
 use crate::header::{IndexHeader, Seeds};
@@ -237,11 +237,8 @@ impl IvfIndex {
 
         if exact_hits.is_empty() { return Vec::new(); }
 
-        // 3. Sort and Truncate (No FlatIndex refinement needed!)
-        exact_hits.sort_unstable_by(|a,b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(a.id.cmp(&b.id)));
-        exact_hits.truncate(k);
-
-        exact_hits
+        // 3. Exact top-k (scores are exact; no refinement needed).
+        stable_top_k(exact_hits, k)
     }
 
     #[inline]
@@ -291,10 +288,7 @@ impl IvfIndex {
                         }
                     }
 
-                    // Local sort and truncate to k
-                    local.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(a.id.cmp(&b.id)));
-                    if local.len() > k_each { local.truncate(k_each); }
-                    (ti, local)
+                    (ti, stable_top_k(local, k_each))
                 }));
             }
 
@@ -305,11 +299,8 @@ impl IvfIndex {
         });
 
         // Global Merge
-        let mut final_hits: Vec<Hit> = partials.into_iter().flatten().collect();
-        final_hits.sort_unstable_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(a.id.cmp(&b.id)));
-        final_hits.truncate(k);
-
-        final_hits
+        let final_hits: Vec<Hit> = partials.into_iter().flatten().collect();
+        stable_top_k(final_hits, k)
     }
     /// Deterministic build fingerprint (FNV-1a over header+centroids+ids).
     pub fn fingerprint(&self) -> u64 {
