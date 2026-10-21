@@ -273,6 +273,12 @@ impl IvfPqIndex {
         stable_top_k(hits, k)
     }
 
+    /// One top-k lookup, then a seeded uniform pick of `pick` of those hits
+    /// (default 5 and 2; see `pick`). Seed with `pick::pick_seed`.
+    pub fn search_pick(&self, q: &[f32], k: usize, pick: usize, required_tag: Option<u64>, current_time: u64, lambda: f32, seed: u64) -> Vec<Hit> {
+        crate::pick::pick_ranked(&self.search_temporal(q, k, required_tag, current_time, lambda), pick, seed)
+    }
+
     /// Legacy wrapper for the standard trait layout (zero decay)
     pub fn search(&self, q: &[f32], k: usize) -> Vec<Hit> {
         self.search_temporal(q, k, None, 0, 0.0)

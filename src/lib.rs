@@ -8,6 +8,7 @@
 //! - `kmeans`: seeded k-means++ trainer.
 //! - `ivf`: IvfIndex (IVF-Flat with refine).
 //! - `eval`: recall@k + determinism check.
+//! - `pick`: seeded pick of 2 of the top 5 for URIEL.
 
 pub mod metric;
 pub mod types;
@@ -27,6 +28,7 @@ pub mod context;
 pub mod time_index;
 pub mod recall;
 pub mod curve;
+pub mod pick;
 pub use ivfpq::{IvfPqIndex, IvfPqParams};
 // src/lib.rs
 pub use context::{

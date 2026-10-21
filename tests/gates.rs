@@ -31,6 +31,7 @@ use common::*;
 
 use raggedy_anndy::eval::wilson_lower_bound;
 use raggedy_anndy::par::parallel_map_indexed;
+use raggedy_anndy::pick::{pick_ranked, pick_seed, PICK_DEFAULT, TOP_K_DEFAULT};
 use raggedy_anndy::seed::SplitMix64;
 use raggedy_anndy::{FlatIndex, Hit, IvfPqIndex, IvfPqParams, Metric};
 use std::sync::{Mutex, OnceLock};
@@ -275,6 +276,65 @@ fn latency_n1m_k5() { gate(1_000_000, 5, Gate::Latency); }
 #[test]
 #[ignore = "SLOW: 1M build (~2 min) + exact truth, ~2.5 GB RAM"]
 fn latency_n1m_k10() { gate(1_000_000, 10, Gate::Latency); }
+
+// ------------------------------------------------------------------ pick
+// Seeded 2-of-5 (Brinn, 2026-10-21): one k=5 lookup, then pick 2. Same
+// latency gates as above, measured on `search_pick`, plus the pick alone.
+
+fn percentiles(mut us: Vec<f64>) -> (f64, f64) {
+    us.sort_by(|a, b| a.total_cmp(b));
+    (percentile_us(&us, 0.50), percentile_us(&us, 0.95))
+}
+
+fn pick_gate(n: usize) {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(n);
+    let (idx, qs) = (&f.index, &f.timing);
+    let (k, p) = (TOP_K_DEFAULT, PICK_DEFAULT);
+    let seed = |i: usize| pick_seed((i / LOOKUPS_PER_TICK) as u64, 7, (i % LOOKUPS_PER_TICK) as u64);
+    let sp = |i: usize| idx.search_pick(row(qs, i), k, p, None, 0, 0.0, seed(i));
+    for i in 0..WARMUP.min(qs.ids.len()) { std::hint::black_box(sp(i)); }
+
+    let (q50, q95) = percentiles((0..qs.ids.len()).map(|i| {
+        let t0 = Instant::now();
+        std::hint::black_box(sp(i));
+        t0.elapsed().as_secs_f64() * 1e6
+    }).collect());
+    let ticks = qs.ids.len() / LOOKUPS_PER_TICK;
+    let (t50, t95) = percentiles((0..ticks).map(|t| {
+        let t0 = Instant::now();
+        for j in 0..LOOKUPS_PER_TICK { std::hint::black_box(sp(t * LOOKUPS_PER_TICK + j)); }
+        t0.elapsed().as_secs_f64() * 1e6
+    }).collect());
+
+    // The pick by itself, on real top-5 results. Batched: one pick is
+    // below Instant's resolution.
+    let tops: Vec<Vec<Hit>> = (0..qs.ids.len()).map(|i| idx.search(row(qs, i), k)).collect();
+    const REPS: usize = 1_000;
+    let t0 = Instant::now();
+    for r in 0..REPS { for (i, top) in tops.iter().enumerate() {
+        std::hint::black_box(pick_ranked(std::hint::black_box(top), p, pick_seed(r as u64, i as u64, 0)));
+    } }
+    let pick_ns = t0.elapsed().as_secs_f64() * 1e9 / (REPS * tops.len()) as f64;
+
+    eprintln!("PICK N={n} k={k} pick={p} | search_pick p50={q50:.0}us p95={q95:.0}us | tick({LOOKUPS_PER_TICK}) p50={t50:.0}us p95={t95:.0}us | pick alone mean={pick_ns:.1}ns");
+    if cfg!(debug_assertions) { eprintln!("  (debug build: latency not gated; use --release)"); return; }
+    let mut fails = Vec::new();
+    if q95 > MAX_QUERY_P95_US { fails.push(format!("search_pick p95 {q95:.0}us > {MAX_QUERY_P95_US}us")); }
+    if t95 >= MAX_TICK_P95_US { fails.push(format!("tick p95 {t95:.0}us >= {MAX_TICK_P95_US}us")); }
+    assert!(fails.is_empty(), "N={n} pick: {}", fails.join("; "));
+}
+
+#[test]
+fn pick_latency_n10k() { pick_gate(10_000); }
+
+#[test]
+#[ignore = "SLOW: 100k build (~20 s) + exact truth"]
+fn pick_latency_n100k() { pick_gate(100_000); }
+
+#[test]
+#[ignore = "SLOW: 1M build (~2 min) + exact truth, ~2.5 GB RAM"]
+fn pick_latency_n1m() { pick_gate(1_000_000); }
 
 // ------------------------------------------------------------------ helpers
 
