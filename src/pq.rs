@@ -162,6 +162,42 @@ impl ProductQuantizer {
         acc
     }
 
+    /// LUT sum for every row of `codes` (row-major, `m` bytes per row) into
+    /// `out` (one f32 per row). Works for both LUT kinds: it is the sum
+    /// `adc_score_ip` and `adc_distance_l2` compute. Rows are scored 4 at a
+    /// time with one sequential sum each, so every value is bit-identical
+    /// to the per-row functions.
+    pub fn adc_sum_rows(&self, lut: &[f32], codes: &[u8], out: &mut [f32]) {
+        let m = self.m;
+        let k = self.k;
+        let rows = out.len();
+        debug_assert_eq!(codes.len(), rows * m);
+        debug_assert!(lut.len() >= m * k);
+        let blocks = rows / 4;
+        for b in 0..blocks {
+            let r = b * 4;
+            let c0 = &codes[r * m..(r + 1) * m];
+            let c1 = &codes[(r + 1) * m..(r + 2) * m];
+            let c2 = &codes[(r + 2) * m..(r + 3) * m];
+            let c3 = &codes[(r + 3) * m..(r + 4) * m];
+            let (mut s0, mut s1, mut s2, mut s3) = (0f32, 0f32, 0f32, 0f32);
+            for j in 0..m {
+                let base = j * k;
+                // codes are < k by construction (nbits <= 8, k = 1 << nbits).
+                unsafe {
+                    s0 += *lut.get_unchecked(base + c0[j] as usize);
+                    s1 += *lut.get_unchecked(base + c1[j] as usize);
+                    s2 += *lut.get_unchecked(base + c2[j] as usize);
+                    s3 += *lut.get_unchecked(base + c3[j] as usize);
+                }
+            }
+            out[r] = s0; out[r + 1] = s1; out[r + 2] = s2; out[r + 3] = s3;
+        }
+        for r in blocks * 4..rows {
+            out[r] = self.adc_score_ip(lut, &codes[r * m..(r + 1) * m]);
+        }
+    }
+
     // -------- Backward-compatible aliases (optional) --------
     /// Historical name used in L2 path.
     pub fn adc_lut(&self, qres: &[f32]) -> Vec<f32> { self.adc_lut_l2(qres) }
@@ -180,4 +216,35 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     let mut s = 0f32;
     for i in 0..a.len() { s += a[i] * b[i]; }
     s
+}
+
+#[cfg(test)]
+mod adc_rows_tests {
+    use super::*;
+    use crate::seed::SplitMix64;
+
+    #[test]
+    fn adc_sum_rows_is_bit_identical_to_per_row_scores() {
+        for (d, m, nbits) in [(64usize, 16usize, 8u8), (30, 6, 8), (32, 8, 4)] {
+            let mut rng = SplitMix64::new(d as u64);
+            let mut pq = ProductQuantizer::new(d, m, nbits, 1, 7);
+            let dsub = d / m;
+            pq.codebooks = (0..m).map(|_| (0..pq.k * dsub).map(|_| rng.next_f64() as f32 - 0.5).collect()).collect();
+            let q: Vec<f32> = (0..d).map(|_| rng.next_f64() as f32 - 0.5).collect();
+            let lut_ip = pq.adc_lut_ip(&q);
+            let lut_l2 = pq.adc_lut_l2(&q);
+            for rows in [0usize, 1, 3, 4, 5, 8, 37] {
+                let codes: Vec<u8> = (0..rows * m).map(|_| rng.gen_range(pq.k) as u8).collect();
+                let mut out = vec![0f32; rows];
+                pq.adc_sum_rows(&lut_ip, &codes, &mut out);
+                for r in 0..rows {
+                    assert_eq!(out[r].to_bits(), pq.adc_score_ip(&lut_ip, &codes[r * m..(r + 1) * m]).to_bits(), "ip d={d} rows={rows} r={r}");
+                }
+                pq.adc_sum_rows(&lut_l2, &codes, &mut out);
+                for r in 0..rows {
+                    assert_eq!(out[r].to_bits(), pq.adc_distance_l2(&lut_l2, &codes[r * m..(r + 1) * m]).to_bits(), "l2 d={d} rows={rows} r={r}");
+                }
+            }
+        }
+    }
 }

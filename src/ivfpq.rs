@@ -68,6 +68,25 @@ const PQ_TRAIN_ROWS: usize = 5000;
     match metric { Metric::Cosine => metric::dot(q, c), Metric::L2 => -metric::l2_distance(q, c) }
 }
 
+/// Coarse score of every centroid as (list, score), 4 centroids at a time.
+/// Bit-identical to `coarse_score` per centroid.
+fn coarse_scores(metric: Metric, q: &[f32], centroids: &[Vec<f32>]) -> Vec<(usize, f32)> {
+    let n = centroids.len();
+    let mut out = Vec::with_capacity(n);
+    let blocks = n / 4;
+    for b in 0..blocks {
+        let j = b * 4;
+        let rows = [&centroids[j][..], &centroids[j + 1][..], &centroids[j + 2][..], &centroids[j + 3][..]];
+        let s = match metric {
+            Metric::Cosine => metric::dot_x4(q, rows),
+            Metric::L2 => { let d = metric::l2_distance_x4(q, rows); [-d[0], -d[1], -d[2], -d[3]] }
+        };
+        for t in 0..4 { out.push((j + t, s[t])); }
+    }
+    for j in blocks * 4..n { out.push((j, coarse_score(metric, q, &centroids[j]))); }
+    out
+}
+
 /// Total order: score desc, then id asc. NaN-safe.
 #[inline] fn by_score_then_id(a_score: f32, a_id: u64, b_score: f32, b_id: u64) -> Ordering {
     b_score.total_cmp(&a_score).then(a_id.cmp(&b_id))
@@ -181,35 +200,43 @@ impl IvfPqIndex {
         let cosine = matches!(self.metric, Metric::Cosine);
         let q_eff = if cosine { normalized(q) } else { q.to_vec() };
 
-        let mut probe: Vec<(usize, f32)> = self.centroids.iter().enumerate()
-            .map(|(i, c)| (i, coarse_score(self.metric, &q_eff, c))).collect();
-        probe.sort_unstable_by(|a, b| by_score_then_id(a.1, a.0 as u64, b.1, b.0 as u64));
-        probe.truncate(self.params.nprobe.max(1));
+        // 1. Coarse: score every centroid, keep the top nprobe by (score desc, list asc).
+        let mut probe = coarse_scores(self.metric, &q_eff, &self.centroids);
+        let np = self.params.nprobe.max(1).min(probe.len());
+        let by_probe = |a: &(usize, f32), b: &(usize, f32)| by_score_then_id(a.1, a.0 as u64, b.1, b.0 as u64);
+        if np > 0 && np < probe.len() { probe.select_nth_unstable_by(np - 1, by_probe); }
+        probe.truncate(np);
+        probe.sort_unstable_by(by_probe);
 
+        // 2. ADC scan: LUT sums for whole lists at a time, then filter.
         // IP LUT is list-independent; the list enters through q·c.
         let lut_ip = if cosine { Some(self.pq.adc_lut_ip(&rotate(&self.opq, &q_eff))) } else { None };
         let mut qres = vec![0.0f32; dim];
-
-        let mut approx = Vec::new();
+        let total: usize = probe.iter().map(|&(li, _)| self.lists[li].len()).sum();
+        let longest = probe.iter().map(|&(li, _)| self.lists[li].len()).max().unwrap_or(0);
+        let mut sums = vec![0.0f32; longest];
+        let mut approx: Vec<Candidate> = Vec::with_capacity(total);
         for &(li, cscore) in &probe {
             let list = &self.lists[li];
-            if list.len() == 0 { continue; }
+            let rows = list.len();
+            if rows == 0 { continue; }
             let lut_l2;
-            let (lut, base) = match &lut_ip {
-                Some(l) => (l, cscore),
+            let lut = match &lut_ip {
+                Some(l) => l,
                 None => {
                     for ((r, &qd), &cd) in qres.iter_mut().zip(&q_eff).zip(&self.centroids[li]) { *r = qd - cd; }
                     lut_l2 = self.pq.adc_lut_l2(&rotate(&self.opq, &qres));
-                    (&lut_l2, 0.0)
+                    &lut_l2
                 }
             };
-            for i in 0..list.len() {
+            let sums = &mut sums[..rows];
+            self.pq.adc_sum_rows(lut, &list.codes[..rows * m], sums);
+            for i in 0..rows {
                 if list.tomb[i] == 1 { continue; }
                 if let Some(mask) = required_tag {
                     match &list.tags { Some(tags) if (tags[i] & mask) != 0 => {}, _ => continue }
                 }
-                let code = list.code_row(m, i);
-                let raw = if cosine { base + self.pq.adc_score_ip(lut, code) } else { -self.pq.adc_distance_l2(lut, code) };
+                let raw = if cosine { cscore + sums[i] } else { -sums[i] };
                 let score = apply_decay(raw, list.timestamps[i], current_time, lambda);
                 approx.push(Candidate { id: list.ids[i], score, li, pos: i });
             }
@@ -222,12 +249,24 @@ impl IvfPqIndex {
             approx.truncate(keep);
         }
 
+        // 3. Exact re-rank of the shortlist, 4 rows at a time.
         let hits: Vec<Hit> = if self.params.store_vecs {
-            approx.iter().map(|c| {
-                let v = self.lists[c.li].vec_row(dim, c.pos);
-                let s = if cosine { metric::dot(&q_eff, v) } else { -metric::l2_distance(&q_eff, v) };
-                Hit { id: c.id, score: apply_decay(s, self.lists[c.li].timestamps[c.pos], current_time, lambda) }
-            }).collect()
+            let exact = |c: &Candidate, s: f32| Hit { id: c.id, score: apply_decay(s, self.lists[c.li].timestamps[c.pos], current_time, lambda) };
+            let row = |c: &Candidate| self.lists[c.li].vec_row(dim, c.pos);
+            let mut out = Vec::with_capacity(approx.len());
+            let mut chunks = approx.chunks_exact(4);
+            for c in &mut chunks {
+                let rows = [row(&c[0]), row(&c[1]), row(&c[2]), row(&c[3])];
+                let s = if cosine { metric::dot_x4(&q_eff, rows) } else {
+                    let d = metric::l2_distance_x4(&q_eff, rows); [-d[0], -d[1], -d[2], -d[3]]
+                };
+                for j in 0..4 { out.push(exact(&c[j], s[j])); }
+            }
+            for c in chunks.remainder() {
+                let v = row(c);
+                out.push(exact(c, if cosine { metric::dot(&q_eff, v) } else { -metric::l2_distance(&q_eff, v) }));
+            }
+            out
         } else {
             approx.iter().map(|c| Hit { id: c.id, score: c.score }).collect()
         };
