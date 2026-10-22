@@ -64,6 +64,80 @@ a snapshot, which then catches up from the op log and swaps in with a logged
 Op log on disk, fsync once a second (up to 1 s of loss accepted), periodic
 snapshots, recovery = snapshot + log tail, full rebuild as fallback.
 
+Built on branch `claude/live-oplog` in three new modules (no new
+dependencies; CRC32 is in-repo). `src/live.rs` and `src/ivfpq.rs` are
+unchanged; `src/opq.rs` gained two read accessors for the snapshot.
+
+| Module | What |
+| --- | --- |
+| `oplog` | record and segment-header format, CRC32, encode/decode |
+| `snapshot` | whole-index snapshot file, atomic write, verified read |
+| `durable` | writer (`create`, `append`, `apply_logged`, `end_tick`, `sync`, `snapshot`), `recover`, `resume` |
+
+Directory layout: `log-{start_seq:020}.log` segments and
+`snap-{seq:020}.snap` snapshots. Seq 1 is the first logged op; "state at
+S" is the index after ops 1..=S.
+
+Log segment: 36-byte header (magic `RAOPLOG\0`, version, `start_seq`, the
+index fingerprint at `start_seq`, CRC32), then records `len u32 | crc32
+u32 | seq u64, tick u64, kind u8, body`, little-endian. A record counts
+only if its length fits, its CRC matches, its body parses to exactly
+`len` bytes and its seq is the previous + 1; the first one that fails ends
+the log, so a torn or corrupt tail is dropped, never mis-parsed. Every
+segment boundary is checked against the header fingerprint.
+
+Writer, per tick: `apply_logged` (logs only ops the index accepted), then
+`end_tick(now)`: one `write` of the tick's records, and `fdatasync` once
+`sync_every` (default 1 s) has passed. A process crash loses at most the
+unflushed tick; a power loss at most `sync_every`.
+
+Snapshot: 56-byte header (magic `RASNAP\0\0`, version, seq, tick,
+fingerprint, payload length, payload CRC32, header CRC32), then model +
+lists + `max_ts`. The id directory is rebuilt from the lists on load
+(every row with `tomb == 0`), not stored. Written to `.tmp`, fsynced,
+renamed, directory fsynced. Load refuses it unless both CRCs, the length,
+`live::check_invariants` and the fingerprint check out. Each snapshot
+starts a new log segment; the newest `keep_snapshots` (default 2)
+snapshots are kept, and the log from the oldest of them on, so a corrupt
+newest snapshot still recovers from the one before. Until two snapshots
+exist the whole log is kept.
+
+Recovery (`recover`, read-only): newest snapshot that verifies + the log
+from its seq; else the whole log on the caller's base model (the index the
+log was created from, checked by fingerprint); else `NoState` and the
+fallback is a full rebuild from source data. `resume` then cuts the bad
+tail off, sets bad snapshots and unreachable segments aside as
+`.corrupt`, and reopens the log at the recovered seq.
+
+**Stage 2 note:** `snapshot::put_list` / `get_list` are the only code that
+knows the list layout. The segmented arena changes them (and bumps
+`SNAPSHOT_VERSION`); the header, atomic write, checks and the op log stay.
+The snapshot currently blocks the writer thread for the whole write; with
+stage 2 it should be written from a published view on another thread.
+
+Tests: `tests/live_durability.rs` (12): every op variant round-trips (bytes
+and file); every truncation and every flipped byte of the last record is
+dropped; seq gaps stop replay; kill after tick T recovers the last flushed
+record (process crash) or the last fsynced one (power loss, file cut at the
+fsync point plus a torn fragment) with the live fingerprint; fsync
+interval; snapshot round-trip incl. OPQ and no raw vectors, flipped bytes
+refused; snapshot + tail equals full replay; corrupt snapshot falls back to
+full replay, wrong base refused; corrupt newest snapshot falls back to the
+older one, pruning; crash between snapshot and new segment.
+
+Measured on the dev container, release build (`durability_timing`, ignored
+by default), 100k built rows + 100k logged inserts, 10 per tick:
+
+| dim | nlist | m | append | log | full replay of 100k ops | snapshot write / read |
+| --- | --- | --- | --- | --- | --- | --- |
+| 128 | 256 | 32 | 195k ops/s | 56.5 MB | 6.0 s | 1.3 s / 0.6 s (114 MB) |
+| 256 | 1024 | 32 | 154k ops/s | 108 MB | 19.4 s | 1.0 s / 0.8 s (218 MB) |
+
+Replay is dominated by the inserts themselves (same cost as live, see
+stage 1); decoding the log alone is 0.5 to 1.0 s. Recovery time is bounded
+by the snapshot interval: at 600 ops/s, a snapshot every 5 minutes leaves at
+most ~180k ops to replay.
+
 ## Stage 5: real memories to PostgreSQL
 
 `Insert` gains a server-set `real` flag. Real memories stay searchable in a
