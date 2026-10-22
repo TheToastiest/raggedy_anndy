@@ -108,7 +108,7 @@ fn coarse_scores(metric: Metric, q: &[f32], centroids: &[Vec<f32>]) -> Vec<(usiz
     b_score.total_cmp(&a_score).then(a_id.cmp(&b_id))
 }
 
-#[inline] fn apply_decay(score: f32, ts: u64, current_time: u64, lambda: f32) -> f32 {
+#[inline] pub(crate) fn apply_decay(score: f32, ts: u64, current_time: u64, lambda: f32) -> f32 {
     if lambda <= 0.0 { return score; }
     let dt = current_time.saturating_sub(ts) as f32;
     let decay = (-lambda * dt).exp().max(1e-9);

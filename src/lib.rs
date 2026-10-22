@@ -10,6 +10,7 @@
 //! - `eval`: recall@k + determinism check.
 //! - `pick`: seeded pick of 2 of the top 5 for URIEL.
 //! - `live`: deterministic insert / delete / upsert / expire / compact for IVF-PQ.
+//! - `real_memory`: pending buffer for server-flagged real memories until the 12-hour commit.
 
 pub mod metric;
 pub mod types;
@@ -31,6 +32,7 @@ pub mod recall;
 pub mod curve;
 pub mod pick;
 pub mod live;
+pub mod real_memory;
 pub use ivfpq::{IvfPqIndex, IvfPqParams, RowLoc};
 // src/lib.rs
 pub use context::{

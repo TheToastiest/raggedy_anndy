@@ -66,9 +66,46 @@ snapshots, recovery = snapshot + log tail, full rebuild as fallback.
 
 ## Stage 5: real memories to PostgreSQL
 
-`Insert` gains a server-set `real` flag. Real memories stay searchable in a
-small pending buffer until the 12-hour commit to SQL, then leave RAM.
-LEGENDARY is a separate flag that never expires in SQL.
+Index side built in `src/real_memory.rs` (branch `claude/live-real-memory`);
+the SQL side is not started. The game server decides what is real
+(endgame-only: meteors, black holes, specialization relics, legendary
+achievements) and flags it at insert time. No automatic importance or
+touch thresholds.
+
+The gap it closes: a real memory leaves the 1-hour window but is not
+committed for up to 12 hours. Each real memory goes into the short-term
+index like any row and also into a pending buffer (`Pending`: SoA columns,
+raw f32 vector, exact Flat scoring) until `commit` takes it.
+
+| Item | Shape |
+| --- | --- |
+| Flags | `flags: u8`, own field, never a tag bit. `REAL = 1` required; `LEGENDARY = 2` only with `REAL`; other bits rejected (`BadFlags`). |
+| Insert | `insert_real(idx, s, buf, id, ts, tags, flags, v)`, or `RealOp::InsertReal` through `real_memory::apply`. Same checks as `live::insert`, plus the id must not be pending. `Op::Insert` is unchanged, so stage-1 callers and logs keep working. |
+| Ops | `RealOp { Live(Op), InsertReal, Commit }`; `Live` is `live::apply`, except `Insert` of a pending id is refused. |
+| Search | `search(idx, buf, q, k, tag, now, lambda)`: index top `k + pending` minus pending ids, plus every pending row scored exactly with the same score and decay as the index re-rank; top-k by (score desc, id asc), each id once. |
+| Commit | `commit(buf, outbox)`: drains the buffer into `Vec<RealRecord { id, ts, tags, flags, vec }>` in (ts, id) order, skips ids already in the outbox, returns how many it appended. Does not touch the short-term index. |
+
+Why a separate op, not a flag on `Op::Insert`: adding a field would change
+every stage-1 caller and the op shape stages 2-4 are building on; the real
+path also needs the pending buffer, which `live::apply` does not take.
+
+Tests: `tests/live_real_memory.rs` (13): survives expiry until commit; gone
+from RAM and once in the outbox after; deterministic commit order and
+contents; a commit re-run after a crash appends nothing; LEGENDARY
+independent of tag bits; bad flags and index errors change nothing; merged
+search deterministic, no repeated ids, tag filter on pending rows, pending
+scores bit-equal to the index re-rank.
+
+What the DB side needs to decide and build:
+- Schema and client (undecided). A record holds `id u64` (Postgres has no
+  unsigned bigint: store as `bigint` bit-cast or `numeric`), `ts u64` (unit
+  is the server's), `tags u64`, `flags u8`, `vec f32 x dim`.
+- Insert with `ON CONFLICT (id) DO NOTHING`; ack, then clear the outbox.
+  Until acked, the outbox must survive a crash (or be rebuilt by replaying
+  the log, which stage 4 must do for `RealOp`).
+- Expiry of non-LEGENDARY rows in SQL (how long?).
+- How the 12-hour commit is scheduled (a logged `RealOp::Commit` replays
+  identically; a wall-clock trigger outside the log does not).
 
 ## Test data
 
@@ -83,3 +120,7 @@ embedding model to use.
 - Embedding model, dim and metric.
 - Real average memories per tick.
 - Tag matching: any-bit vs all-bits (recommend a per-query choice).
+- Stage 5: should `Delete`/`Upsert` of a pending id also change the pending
+  row? Today they only touch the index, so a real memory stays pending.
+- Stage 5: stage 4's log must record `RealOp` (or `Op` gains its variants at
+  merge time) so recovery rebuilds the pending buffer.
