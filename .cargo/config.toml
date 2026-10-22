@@ -1,0 +1,8 @@
+# Pin the CPU baseline so one binary behaves the same on every x86_64 Linux
+# machine we run on (dev laptop under WSL, Xeon E-2286G server).
+# x86-64-v3 = AVX, AVX2, BMI1/2, F16C, FMA, LZCNT, MOVBE, XSAVE.
+# Never use target-cpu=native: it bakes in whatever the build host has
+# (e.g. AVX-512) and the binary may crash or differ elsewhere.
+# See README.md, "Build target".
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
