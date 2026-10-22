@@ -210,85 +210,8 @@ impl IvfPqIndex {
     /// Primary search API injected with native temporal decay math.
     /// A query with any NaN or infinite component has no usable score and returns no hits.
     pub fn search_temporal(&self, q: &[f32], k: usize, required_tag: Option<u64>, current_time: u64, lambda: f32) -> Vec<Hit> {
-        if q.iter().any(|x| !x.is_finite()) { return Vec::new(); }
-        let dim = self.dim;
-        let m = self.params.m;
-        let cosine = matches!(self.metric, Metric::Cosine);
-        let q_eff = if cosine { normalized(q) } else { q.to_vec() };
-
-        // 1. Coarse: score every centroid, keep the top nprobe by (score desc, list asc).
-        let mut probe = coarse_scores(self.metric, &q_eff, &self.centroids);
-        let np = self.params.nprobe.max(1).min(probe.len());
-        let by_probe = |a: &(usize, f32), b: &(usize, f32)| by_score_then_id(a.1, a.0 as u64, b.1, b.0 as u64);
-        if np > 0 && np < probe.len() { probe.select_nth_unstable_by(np - 1, by_probe); }
-        probe.truncate(np);
-        probe.sort_unstable_by(by_probe);
-
-        // 2. ADC scan: LUT sums for whole lists at a time, then filter.
-        // IP LUT is list-independent; the list enters through q·c.
-        let lut_ip = if cosine { Some(self.pq.adc_lut_ip(&rotate(&self.opq, &q_eff))) } else { None };
-        let mut qres = vec![0.0f32; dim];
-        let total: usize = probe.iter().map(|&(li, _)| self.lists[li].len()).sum();
-        let longest = probe.iter().map(|&(li, _)| self.lists[li].len() - self.lists[li].head).max().unwrap_or(0);
-        let mut sums = vec![0.0f32; longest];
-        let mut approx: Vec<Candidate> = Vec::with_capacity(total);
-        for &(li, cscore) in &probe {
-            let list = &self.lists[li];
-            let head = list.head;
-            let rows = list.len() - head;
-            if rows == 0 { continue; }
-            let lut_l2;
-            let lut = match &lut_ip {
-                Some(l) => l,
-                None => {
-                    for ((r, &qd), &cd) in qres.iter_mut().zip(&q_eff).zip(&self.centroids[li]) { *r = qd - cd; }
-                    lut_l2 = self.pq.adc_lut_l2(&rotate(&self.opq, &qres));
-                    &lut_l2
-                }
-            };
-            let sums = &mut sums[..rows];
-            self.pq.adc_sum_rows(lut, &list.codes[head * m..list.len() * m], sums);
-            for (j, &sum) in sums.iter().enumerate() {
-                let i = head + j;
-                if list.tomb[i] == 1 { continue; }
-                if let Some(mask) = required_tag {
-                    if (list.tags[i] & mask) == 0 { continue; }
-                }
-                let raw = if cosine { cscore + sum } else { -sum };
-                let score = apply_decay(raw, list.timestamps[i], current_time, lambda);
-                approx.push(Candidate { id: list.ids[i], score, li, pos: i });
-            }
-        }
-
-        let keep = self.params.refine.max(k);
-        let cmp = |a: &Candidate, b: &Candidate| by_score_then_id(a.score, a.id, b.score, b.id);
-        if approx.len() > keep {
-            approx.select_nth_unstable_by(keep - 1, cmp);
-            approx.truncate(keep);
-        }
-
-        // 3. Exact re-rank of the shortlist, 4 rows at a time.
-        let hits: Vec<Hit> = if self.params.store_vecs {
-            let exact = |c: &Candidate, s: f32| Hit { id: c.id, score: apply_decay(s, self.lists[c.li].timestamps[c.pos], current_time, lambda) };
-            let row = |c: &Candidate| self.lists[c.li].vec_row(dim, c.pos);
-            let mut out = Vec::with_capacity(approx.len());
-            let mut chunks = approx.chunks_exact(4);
-            for c in &mut chunks {
-                let rows = [row(&c[0]), row(&c[1]), row(&c[2]), row(&c[3])];
-                let s = if cosine { metric::dot_x4(&q_eff, rows) } else {
-                    let d = metric::l2_distance_x4(&q_eff, rows); [-d[0], -d[1], -d[2], -d[3]]
-                };
-                for j in 0..4 { out.push(exact(&c[j], s[j])); }
-            }
-            for c in chunks.remainder() {
-                let v = row(c);
-                out.push(exact(c, if cosine { metric::dot(&q_eff, v) } else { -metric::l2_distance(&q_eff, v) }));
-            }
-            out
-        } else {
-            approx.iter().map(|c| Hit { id: c.id, score: c.score }).collect()
-        };
-        stable_top_k(hits, k)
+        let rows = Contig { lists: &self.lists, m: self.params.m, dim: self.dim };
+        search_rows(self, &rows, q, k, required_tag, current_time, lambda)
     }
 
     /// One top-k lookup, then a seeded uniform pick of `pick` of those hits
@@ -330,6 +253,125 @@ impl IvfPqIndex {
         }
         h
     }
+}
+
+/// Rows `[r, r + ids.len())` of one list, contiguous in memory.
+pub struct Run<'a> { pub ids: &'a [u64], pub ts: &'a [u64], pub tags: &'a [u64], pub codes: &'a [u8] }
+
+/// Where search reads rows from: `IvfPqList` columns (one run per list) or
+/// a published view's fixed-size blocks (`views`, one run per block). Row
+/// numbers are the list's own; only the storage differs, so both layouts
+/// share `search_rows` and score bit-identically.
+pub(crate) trait ListRows {
+    /// (head, len): rows `[head, len)` of list `li` are searched.
+    fn span(&self, li: usize) -> (usize, usize);
+    fn tomb(&self, li: usize) -> &[u8];
+    /// The contiguous run of list `li` from row `r`, ending at or before `end`.
+    fn run(&self, li: usize, r: usize, end: usize) -> Run<'_>;
+    fn ts(&self, li: usize, r: usize) -> u64;
+    fn vec_row(&self, li: usize, r: usize) -> &[f32];
+}
+
+/// `IvfPqIndex`'s own layout: each list is one run.
+struct Contig<'a> { lists: &'a [IvfPqList], m: usize, dim: usize }
+
+impl ListRows for Contig<'_> {
+    #[inline] fn span(&self, li: usize) -> (usize, usize) { (self.lists[li].head, self.lists[li].len()) }
+    #[inline] fn tomb(&self, li: usize) -> &[u8] { &self.lists[li].tomb }
+    #[inline] fn run(&self, li: usize, r: usize, end: usize) -> Run<'_> {
+        let l = &self.lists[li];
+        Run { ids: &l.ids[r..end], ts: &l.timestamps[r..end], tags: &l.tags[r..end], codes: &l.codes[r * self.m..end * self.m] }
+    }
+    #[inline] fn ts(&self, li: usize, r: usize) -> u64 { self.lists[li].timestamps[r] }
+    #[inline] fn vec_row(&self, li: usize, r: usize) -> &[f32] { self.lists[li].vec_row(self.dim, r) }
+}
+
+/// Search `rows` with `model`'s centroids, OPQ, codebooks and params
+/// (`model.lists` is not read). The one scoring path for every layout.
+pub(crate) fn search_rows<L: ListRows>(model: &IvfPqIndex, rows: &L, q: &[f32], k: usize, required_tag: Option<u64>, current_time: u64, lambda: f32) -> Vec<Hit> {
+    if q.iter().any(|x| !x.is_finite()) { return Vec::new(); }
+    let dim = model.dim;
+    let cosine = matches!(model.metric, Metric::Cosine);
+    let q_eff = if cosine { normalized(q) } else { q.to_vec() };
+
+    // 1. Coarse: score every centroid, keep the top nprobe by (score desc, list asc).
+    let mut probe = coarse_scores(model.metric, &q_eff, &model.centroids);
+    let np = model.params.nprobe.max(1).min(probe.len());
+    let by_probe = |a: &(usize, f32), b: &(usize, f32)| by_score_then_id(a.1, a.0 as u64, b.1, b.0 as u64);
+    if np > 0 && np < probe.len() { probe.select_nth_unstable_by(np - 1, by_probe); }
+    probe.truncate(np);
+    probe.sort_unstable_by(by_probe);
+
+    // 2. ADC scan: LUT sums for whole runs at a time, then filter.
+    // IP LUT is list-independent; the list enters through q·c.
+    let lut_ip = if cosine { Some(model.pq.adc_lut_ip(&rotate(&model.opq, &q_eff))) } else { None };
+    let mut qres = vec![0.0f32; dim];
+    let total: usize = probe.iter().map(|&(li, _)| rows.span(li).1).sum();
+    let longest = probe.iter().map(|&(li, _)| { let (h, n) = rows.span(li); n - h }).max().unwrap_or(0);
+    let mut sums = vec![0.0f32; longest];
+    let mut approx: Vec<Candidate> = Vec::with_capacity(total);
+    for &(li, cscore) in &probe {
+        let (head, len) = rows.span(li);
+        if len == head { continue; }
+        let lut_l2;
+        let lut = match &lut_ip {
+            Some(l) => l,
+            None => {
+                for ((r, &qd), &cd) in qres.iter_mut().zip(&q_eff).zip(&model.centroids[li]) { *r = qd - cd; }
+                lut_l2 = model.pq.adc_lut_l2(&rotate(&model.opq, &qres));
+                &lut_l2
+            }
+        };
+        let tomb = rows.tomb(li);
+        let mut r = head;
+        while r < len {
+            let run = rows.run(li, r, len);
+            let n = run.ids.len();
+            let sums = &mut sums[..n];
+            model.pq.adc_sum_rows(lut, run.codes, sums);
+            for (j, &sum) in sums.iter().enumerate() {
+                let i = r + j;
+                if tomb[i] == 1 { continue; }
+                if let Some(mask) = required_tag {
+                    if (run.tags[j] & mask) == 0 { continue; }
+                }
+                let raw = if cosine { cscore + sum } else { -sum };
+                let score = apply_decay(raw, run.ts[j], current_time, lambda);
+                approx.push(Candidate { id: run.ids[j], score, li, pos: i });
+            }
+            r += n;
+        }
+    }
+
+    let keep = model.params.refine.max(k);
+    let cmp = |a: &Candidate, b: &Candidate| by_score_then_id(a.score, a.id, b.score, b.id);
+    if approx.len() > keep {
+        approx.select_nth_unstable_by(keep - 1, cmp);
+        approx.truncate(keep);
+    }
+
+    // 3. Exact re-rank of the shortlist, 4 rows at a time.
+    let hits: Vec<Hit> = if model.params.store_vecs {
+        let exact = |c: &Candidate, s: f32| Hit { id: c.id, score: apply_decay(s, rows.ts(c.li, c.pos), current_time, lambda) };
+        let row = |c: &Candidate| rows.vec_row(c.li, c.pos);
+        let mut out = Vec::with_capacity(approx.len());
+        let mut chunks = approx.chunks_exact(4);
+        for c in &mut chunks {
+            let rs = [row(&c[0]), row(&c[1]), row(&c[2]), row(&c[3])];
+            let s = if cosine { metric::dot_x4(&q_eff, rs) } else {
+                let d = metric::l2_distance_x4(&q_eff, rs); [-d[0], -d[1], -d[2], -d[3]]
+            };
+            for j in 0..4 { out.push(exact(&c[j], s[j])); }
+        }
+        for c in chunks.remainder() {
+            let v = row(c);
+            out.push(exact(c, if cosine { metric::dot(&q_eff, v) } else { -metric::l2_distance(&q_eff, v) }));
+        }
+        out
+    } else {
+        approx.iter().map(|c| Hit { id: c.id, score: c.score }).collect()
+    };
+    stable_top_k(hits, k)
 }
 
 /// Build with an explicit worker count. Output is bit-identical for every `threads` value.

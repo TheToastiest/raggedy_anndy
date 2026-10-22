@@ -43,14 +43,72 @@ At 10 inserts per tick, dim 256 / nlist 1024 costs ~3.2 ms of the writer
 thread per tick. The centroid scan is scalar; using the existing 4-wide dot
 kernel there is the first speed-up to try.
 
-## Stage 2: separate query threads
+## Stage 2: separate query threads (built)
 
-Append-only row arena in fixed-capacity segments (rows never move), plus a
-per-tick published view (`Arc`) of the small mutable metadata: tombstones,
-row counts, list heads. Query threads read the view from the end of the
-previous tick; the writer never blocks them. Blocks freed by compaction or
-expiry are reused only after every view that can see them is dropped.
-Tests: view isolation under loom, arena under Miri, no early reuse.
+One writer thread applies the ops of tick T while query threads read the
+view published at the end of tick T-1. `IvfPqIndex` stays the
+single-threaded type; the writer/view pair sits beside it and both search
+through the same scoring code (`ivfpq::search_rows`).
+
+- `src/arena.rs`: `Block`, a fixed-capacity run of rows of one list (ids,
+  timestamps, tags, PQ codes, raw vectors as SoA columns), allocated whole
+  so rows never move. Rows are appended in slot order; a written slot is
+  never written again until `reset`, which needs `&mut` (no other holder).
+  Readers only form references below an Acquire load of the block's
+  `filled` count. All `unsafe` of this stage is in this file.
+- `src/views.rs`: `Writer` and `View`. Row `r` of a list is in
+  `blocks[r / block_rows]`. The small mutable metadata per list (block
+  table, row count, head, dead count, tombstones) is `ListMeta`: the writer
+  owns one set, each `View` owns a copy, and rows past a view's count are
+  invisible to it. Deletes and expiry change only the writer's copy. The id
+  directory is writer-only.
+- Publish (`views::publish`, once per tick): take a pooled view no query
+  holds (`Arc::get_mut`), copy in only the lists changed since that view's
+  own tick, give it the new seq, swap it into the shared slot. Queries get
+  the newest view with `views::current`: one `Arc` clone under a mutex that
+  the writer holds only for a pointer swap, never during its work.
+- Reclamation: compaction retires a list's old blocks. A retired block is
+  reset and reused only when its `Arc` is unique, i.e. no view, held by a
+  query or pooled by the writer, can see it. The writer keeps one idle
+  view as a spare and drops the others at publish so they do not pin
+  retired blocks. Expiry only advances `head` (as in stage 1); its rows'
+  blocks are freed when the list is compacted.
+- Same ops, same results: `views::apply` returns the same `Applied` as
+  `live::apply`, and `views::to_index(view)` has the same `fingerprint` as
+  the `IvfPqIndex` after the same ops. Inserts stay allocation-free after
+  `views::reserve`.
+
+Tests: `tests/live_views.rs` (8): view 0 equals the index for block sizes
+1 to 4096; writer equals `live::apply` tick by tick (results, search bits,
+fingerprint), with and without raw vectors; an old view returns identical
+bits after every op of the next tick (deletes of its top hits, upserts,
+inserts, expiry of half the rows, compaction of every list) and while a
+writer thread runs 6000 ops; retired blocks are not reused while an old
+view lives and are reused after; a writer thread plus 4 query threads
+(some holding old views) match the single-threaded reference for every
+view seq. `tests/live_alloc.rs` adds the writer's insert/delete/upsert.
+Miri (data races, weak memory) passes on the arena unit tests and on a
+tiny writer-plus-readers run:
+`cargo +nightly miri test --lib arena` and
+`MIRIFLAGS=-Zmiri-deterministic-floats cargo +nightly miri test --test live_views tiny_`
+(Miri otherwise perturbs `exp`, which decay uses). Loom is not used: it
+needs its own sync types through the crate, and `--cfg loom` also switches
+tokio into loom mode.
+
+Measured on the dev container (4 cores, shared, noisy), release, N=100k,
+dim 128, nlist 512, nprobe 16, refine 200, m 32, k=10:
+
+| | query p50 | query p95 |
+| --- | --- | --- |
+| `IvfPqIndex::search` | 123-167 us | 185-244 us |
+| view, writer idle | 143-150 us | 190-214 us |
+| view, writer thread inserting 10 rows per 60 Hz tick | 137-159 us | 186-248 us |
+
+Writer tick (10 inserts + publish): p50 ~530 us, p95 ~820 us; publish
+alone p95 25-33 us. `latency_n100k` gates unchanged within noise (query
+p95 150-180 us at k=10, 233 us at k=5; before 215 / 263 us).
+`cargo test --release --test live_views concurrent_query_latency -- --ignored --nocapture`
+reprints these (`RA_BLOCK_ROWS` sets the block size, default 256).
 
 ## Stage 3: drift and background rebuild
 
