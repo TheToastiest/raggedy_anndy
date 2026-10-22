@@ -70,6 +70,12 @@ pub fn scratch_for(idx: &IvfPqIndex) -> Scratch {
     Scratch { view: vec![0.0; idx.dim], res: vec![0.0; idx.dim], rot: vec![0.0; idx.dim], codes: vec![0; idx.params.m] }
 }
 
+/// The encoded vector (OPQ-rotated residual, or the residual without OPQ)
+/// and PQ codes of the last row `s` wrote. Stats hook for `drift::record`.
+pub fn last_encoded<'a>(idx: &IvfPqIndex, s: &'a Scratch) -> (&'a [f32], &'a [u8]) {
+    (if idx.opq.is_some() { &s.rot } else { &s.res }, &s.codes)
+}
+
 /// Apply one op. See `Op` for each variant's meaning.
 pub fn apply(idx: &mut IvfPqIndex, s: &mut Scratch, op: &Op) -> Result<Applied, WriteError> {
     match op {

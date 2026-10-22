@@ -54,10 +54,96 @@ Tests: view isolation under loom, arena under Miri, no early reuse.
 
 ## Stage 3: drift and background rebuild
 
-Per-list stats (quantisation error, residual norm, list imbalance, churn) on
-every insert. Crossing a threshold starts a rebuild on the shared worker from
-a snapshot, which then catches up from the op log and swaps in with a logged
-`SwapModel` op. Tests: rebuild reproducible, swap replays.
+Built in new modules, `src/drift.rs` and `src/rebuild.rs`; the only change
+to stage 1 code is the `live::last_encoded` stats hook.
+
+The model (centroids, OPQ, PQ codebooks) is frozen per epoch; centroids
+never move live.
+
+`drift`: per-list f64 sums accumulated in op order by `drift::record`:
+quantisation error ||r - decode(code)||^2 (r = OPQ(v - c), read from the
+writer's scratch, so no row is encoded twice), residual norm ||r||^2, insert
+counts, and removed rows (deletes, upsert replacements, expiries).
+`drift::baseline` measures the same sums on the training rows right after a
+build. `drift::check` (O(nlist)) returns the values and a `fired` bitmask:
+
+| Signal | Measure | Default threshold |
+| --- | --- | --- |
+| `QERR` | mean qerr per insert this epoch / baseline mean | 1.5 |
+| `RNORM` | mean residual norm per insert / baseline mean | 1.5 |
+| `IMBALANCE` | largest live list / mean live list | 4.0 |
+| `CHURN` | (inserts + removed this epoch) / live rows at epoch start | 0.5 |
+
+Thresholds are a `Thresholds` value (`default_thresholds()` gives the above).
+It also has `min_inserts` (default 256): the two ratios are not checked
+before that many inserts in the epoch, because a handful of rows moves the
+mean too much. On the test data the in-distribution ratios peak at 1.08 and
+1.02 after 256 inserts; shifted content reaches 12.3 and 3.8.
+
+`rebuild`, plain data plus free functions:
+
+| Function | Thread | Does |
+| --- | --- | --- |
+| `start(idx)` | writer | epoch 0 state (`Live`): index, scratch, `seq`, epoch, base seed, baseline, stats |
+| `write(st, op)` | writer | `live::apply` + `drift::record` (+ carry while a rebuild is pending); caller logs `LogOp::Write(op)` |
+| `snapshot(st)` | writer | live rows in ascending id order (raw vectors, ts, tags), `max_ts`; starts the carry |
+| `rebuild(snap, base_seed, threads)` | worker | seed `epoch_seed(base_seed, epoch + 1)`, existing deterministic build, tags and `max_ts` restored, new baseline |
+| `catch_up(r, carry)` | writer | applies the carried ops not yet applied; any split gives the same result |
+| `swap(st, r)` | writer | refuses unless caught up; returns `LogOp::SwapModel { epoch, snapshot_seq, model_hash }` for the log |
+| `replay(base, log, threads)` | any | snapshots where `SwapModel` entries say, rebuilds, checks the hash, swaps |
+
+The carry: a capped `Expire` walks lists in layout order, so re-running it
+on the new layout kills different rows than the live index killed and
+reported. Catch-up therefore applies effects, not ops: an expiry carries as
+a `Delete` of each id it killed, `Compact` (storage only) and refused ops
+carry nothing, inserts, upserts and deletes carry as they are. Refusals agree
+on both indexes because the live ids and `max_ts` agree.
+
+The new model depends only on the snapshot (the log up to `snapshot_seq`),
+never on when the worker finishes. Where the swap lands is the writer's
+choice and is recorded in the log; `replay` of that log reproduces the
+state byte for byte. Lists stay time-sorted: build sorts rows by
+(ts, input order).
+
+Tests (`tests/live_drift.rs`, 11 + 1 timing aid): signals fire at the same op
+(319) on every run, including on another thread, for shifted content and
+never fire for 40% more training-distribution rows; thresholds are
+parameters; the baseline equals the stats of inserting the training rows,
+with and without OPQ;
+rebuilds from one snapshot match (model hash and fingerprint) for 1 and 5
+threads and on a worker vs inline, with a capped expiry during the rebuild
+leaving exactly the live index's ids; replaying a log with one or two
+`SwapModel` entries equals the live run for three swap timings; a wrong
+logged hash and an early swap are refused.
+
+Recall@10 against an exact `FlatIndex` (20k rows, dim 32, nlist 32, nprobe 4,
+refine 64): epoch 0 0.7075; after the oldest half expired and the same
+number of shifted rows arrived, 0.5817 (0.2845 on shifted queries); after
+the rebuild and swap, 0.8295. Higher than epoch 0 because each distribution
+now holds half the rows.
+
+Snapshot + rebuild of 100k rows on the dev container (4 threads, release,
+`rebuild_time`, ignored by default):
+
+| N | dim | nlist | m | snapshot (writer) | rebuild (worker) |
+| --- | --- | --- | --- | --- | --- |
+| 100k | 128 | 256 | 32 | 36 ms | 9.0 s |
+| 100k | 256 | 1024 | 32 | 82 ms | 102 s |
+
+The rebuild is dominated by the scalar coarse k-means (25 iterations over
+up to nlist x 256 rows) and the encode; same first speed-up as the insert path.
+
+Open:
+- Rebuild thrash: while a shift is still arriving, each new model is
+  trained on part of it, so the signals fire again soon after every swap
+  (every ~320 ops in the test). Needs a policy: a cooldown, hysteresis, or
+  a minimum number of ops per epoch. The tests cap rebuilds at 2.
+- Snapshot cost is O(live rows) on the writer thread. With the stage 2
+  arena (rows never move) the snapshot can be a view handed to the worker.
+- While a rebuild is pending, `write` clones each carried op (allocates).
+- Swap position: now "when the writer sees the worker is done", recorded
+  in the log. A fixed lag after the snapshot would make the live run itself
+  independent of timing, at the cost of blocking the writer if the worker is late.
 
 ## Stage 4: durability
 
