@@ -9,6 +9,7 @@
 //! - `ivf`: IvfIndex (IVF-Flat with refine).
 //! - `eval`: recall@k + determinism check.
 //! - `pick`: seeded pick of 2 of the top 5 for URIEL.
+//! - `live`: deterministic insert / delete / upsert / expire / compact for IVF-PQ.
 
 pub mod metric;
 pub mod types;
@@ -29,7 +30,8 @@ pub mod time_index;
 pub mod recall;
 pub mod curve;
 pub mod pick;
-pub use ivfpq::{IvfPqIndex, IvfPqParams};
+pub mod live;
+pub use ivfpq::{IvfPqIndex, IvfPqParams, RowLoc};
 // src/lib.rs
 pub use context::{
     ContextCfg,

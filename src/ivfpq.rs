@@ -7,6 +7,7 @@ use crate::opq::Opq;
 use crate::par::parallel_map_indexed;
 use crate::seed::SplitMix64;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -22,15 +23,25 @@ pub struct IvfPqParams {
     pub opq_mode: OpqMode, pub opq_sweeps: usize, pub store_vecs: bool,
 }
 
+/// One inverted list, columns side by side (SoA). Rows are in arrival
+/// order, so `timestamps` never decreases within a list. Rows before
+/// `head` were expired and are always dead (`tomb == 1`); `dead` counts
+/// every dead row, before or after `head`. See `live` for the write path.
 #[derive(Clone, Debug)]
 pub struct IvfPqList {
     pub ids: Vec<u64>,
     pub codes: Vec<u8>,
     pub tomb: Vec<u8>,
-    pub timestamps: Vec<u64>, // NEW: Temporal tracking array
-    pub tags: Option<Vec<u64>>,
+    pub timestamps: Vec<u64>,
+    pub tags: Vec<u64>, // 0 = untagged
     pub vecs: Option<Vec<f32>>,
+    pub head: usize,
+    pub dead: usize,
 }
+
+/// Where a live id is stored: `lists[list]`, row `row`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowLoc { pub list: u32, pub row: u32 }
 
 impl IvfPqList {
     #[inline] pub fn len(&self) -> usize { self.ids.len() }
@@ -47,6 +58,11 @@ pub struct IvfPqIndex {
     pub metric: Metric, pub dim: usize, pub params: IvfPqParams,
     pub centroids: Vec<Vec<f32>>, pub centroids_u: Option<Vec<Vec<f32>>>,
     pub pq: ProductQuantizer, pub opq: Option<Opq>, pub lists: Vec<IvfPqList>,
+    /// id -> location of its live row. Lookup only: never iterated, so its
+    /// hash order cannot leak into results or fingerprints.
+    pub dir: HashMap<u64, RowLoc>,
+    /// Newest timestamp written. Live inserts may not go below it.
+    pub max_ts: u64,
 }
 
 /// Rows per work unit. Fixed (not derived from core count) so every reduction runs in the same order.
@@ -56,7 +72,7 @@ const COARSE_ROWS_PER_LIST: usize = 256;
 /// Residual rows used to train OPQ and PQ (deterministic stride sample).
 const PQ_TRAIN_ROWS: usize = 5000;
 
-#[inline] fn norm_inplace(v: &mut [f32]) {
+#[inline] pub(crate) fn norm_inplace(v: &mut [f32]) {
     let mut n = 0.0f32; for &x in v.iter() { n += x * x; }
     if n > 0.0 { let inv = n.sqrt().recip(); for x in v { *x *= inv; } }
 }
@@ -64,7 +80,7 @@ const PQ_TRAIN_ROWS: usize = 5000;
 #[inline] fn normalized(v: &[f32]) -> Vec<f32> { let mut o = v.to_vec(); norm_inplace(&mut o); o }
 
 /// Coarse score, higher is better. Cosine inputs are unit length, so q·c ranks like -||q-c||².
-#[inline] fn coarse_score(metric: Metric, q: &[f32], c: &[f32]) -> f32 {
+#[inline] pub(crate) fn coarse_score(metric: Metric, q: &[f32], c: &[f32]) -> f32 {
     match metric { Metric::Cosine => metric::dot(q, c), Metric::L2 => -metric::l2_distance(q, c) }
 }
 
@@ -177,7 +193,7 @@ fn train_opq(mode: OpqMode, dim: usize, m: usize, residuals: &[Vec<f32>], sweeps
     }
 }
 
-#[inline] fn rotate(opq: &Option<Opq>, x: &[f32]) -> Vec<f32> {
+#[inline] pub(crate) fn rotate(opq: &Option<Opq>, x: &[f32]) -> Vec<f32> {
     match opq { Some(o) => o.apply(x), None => x.to_vec() }
 }
 
@@ -213,12 +229,13 @@ impl IvfPqIndex {
         let lut_ip = if cosine { Some(self.pq.adc_lut_ip(&rotate(&self.opq, &q_eff))) } else { None };
         let mut qres = vec![0.0f32; dim];
         let total: usize = probe.iter().map(|&(li, _)| self.lists[li].len()).sum();
-        let longest = probe.iter().map(|&(li, _)| self.lists[li].len()).max().unwrap_or(0);
+        let longest = probe.iter().map(|&(li, _)| self.lists[li].len() - self.lists[li].head).max().unwrap_or(0);
         let mut sums = vec![0.0f32; longest];
         let mut approx: Vec<Candidate> = Vec::with_capacity(total);
         for &(li, cscore) in &probe {
             let list = &self.lists[li];
-            let rows = list.len();
+            let head = list.head;
+            let rows = list.len() - head;
             if rows == 0 { continue; }
             let lut_l2;
             let lut = match &lut_ip {
@@ -230,13 +247,14 @@ impl IvfPqIndex {
                 }
             };
             let sums = &mut sums[..rows];
-            self.pq.adc_sum_rows(lut, &list.codes[..rows * m], sums);
-            for i in 0..rows {
+            self.pq.adc_sum_rows(lut, &list.codes[head * m..list.len() * m], sums);
+            for (j, &sum) in sums.iter().enumerate() {
+                let i = head + j;
                 if list.tomb[i] == 1 { continue; }
                 if let Some(mask) = required_tag {
-                    match &list.tags { Some(tags) if (tags[i] & mask) != 0 => {}, _ => continue }
+                    if (list.tags[i] & mask) == 0 { continue; }
                 }
-                let raw = if cosine { cscore + sums[i] } else { -sums[i] };
+                let raw = if cosine { cscore + sum } else { -sum };
                 let score = apply_decay(raw, list.timestamps[i], current_time, lambda);
                 approx.push(Candidate { id: list.ids[i], score, li, pos: i });
             }
@@ -295,16 +313,19 @@ impl IvfPqIndex {
         h = fnv(h, self.params.m as u64);
         h = fnv(h, self.pq.nbits as u64);
         h = fnv(h, self.centroids.len() as u64);
+        h = fnv(h, self.max_ts);
         for c in &self.centroids { for &x in c { h = fnv(h, x.to_bits() as u64); } }
         if let Some(o) = &self.opq { for x in o.fingerprint_bits() { h = fnv(h, x); } }
         for cb in &self.pq.codebooks { for &x in cb { h = fnv(h, x.to_bits() as u64); } }
         for l in &self.lists {
             h = fnv(h, l.len() as u64);
+            h = fnv(h, l.head as u64);
+            h = fnv(h, l.dead as u64);
             for &id in &l.ids { h = fnv(h, id); }
             for &ts in &l.timestamps { h = fnv(h, ts); }
             for &t in &l.tomb { h = fnv(h, t as u64); }
             for &c in &l.codes { h = fnv(h, c as u64); }
-            if let Some(tags) = &l.tags { for &t in tags { h = fnv(h, t); } }
+            for &t in &l.tags { h = fnv(h, t); }
             if let Some(vecs) = &l.vecs { for &x in vecs { h = fnv(h, x.to_bits() as u64); } }
         }
         h
@@ -361,22 +382,37 @@ pub(crate) fn build_with_threads(metric: Metric, dim: usize, data: &[(u64, Vec<f
         out
     }).into_iter().flatten().collect();
 
-    // 6. Scatter into per-list SoA columns in input order.
-    let mut lists: Vec<IvfPqList> = (0..nlist).map(|_| IvfPqList {
-        ids: Vec::new(), codes: Vec::new(), tomb: Vec::new(), timestamps: Vec::new(), tags: None,
-        vecs: if params.store_vecs { Some(Vec::new()) } else { None },
-    }).collect();
-    for (i, (id, _, ts)) in data.iter().enumerate() {
-        let list = &mut lists[assign[i]];
+    // 6. Scatter into per-list SoA columns in (timestamp, input) order, the
+    //    order live inserts would have produced: lists stay sorted by time,
+    //    which is what lets `live::expire` stop at the first young row.
+    let mut lists: Vec<IvfPqList> = (0..nlist).map(|_| empty_list(params.store_vecs)).collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| data[i].2); // stable: equal timestamps keep input order
+    let mut dir = HashMap::with_capacity(n);
+    for i in order {
+        let (id, _, ts) = &data[i];
+        let li = assign[i];
+        let list = &mut lists[li];
+        let prev = dir.insert(*id, RowLoc { list: li as u32, row: list.ids.len() as u32 });
+        assert!(prev.is_none(), "duplicate id {id} in build input");
         list.ids.push(*id);
         list.timestamps.push(*ts);
         list.tomb.push(0);
+        list.tags.push(0);
         list.codes.extend_from_slice(&codes[i * params.m..(i + 1) * params.m]);
         if let Some(vecs) = &mut list.vecs { vecs.extend_from_slice(&views[i * dim..(i + 1) * dim]); }
     }
+    let max_ts = data.iter().map(|d| d.2).max().unwrap_or(0);
 
     let centroids = centroids.chunks(dim).map(|c| c.to_vec()).collect();
-    IvfPqIndex { metric, dim, params, centroids, centroids_u: None, pq, opq, lists }
+    IvfPqIndex { metric, dim, params, centroids, centroids_u: None, pq, opq, lists, dir, max_ts }
+}
+
+pub(crate) fn empty_list(store_vecs: bool) -> IvfPqList {
+    IvfPqList {
+        ids: Vec::new(), codes: Vec::new(), tomb: Vec::new(), timestamps: Vec::new(), tags: Vec::new(),
+        vecs: if store_vecs { Some(Vec::new()) } else { None }, head: 0, dead: 0,
+    }
 }
 
 #[cfg(test)]

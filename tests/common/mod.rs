@@ -163,7 +163,7 @@ pub fn ivfpq_build_digest(idx: &IvfPqIndex) -> u64 {
         for &t in &l.timestamps { mix(&mut h, t); }
         for &t in &l.tomb { mix(&mut h, t as u64); }
         if let Some(v) = &l.vecs { for &x in v { mix(&mut h, x.to_bits() as u64); } }
-        if let Some(tg) = &l.tags { for &x in tg { mix(&mut h, x); } }
+        for &x in &l.tags { mix(&mut h, x); }
     }
     h
 }

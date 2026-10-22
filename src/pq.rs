@@ -84,8 +84,15 @@ impl ProductQuantizer {
 
     /// Encode a full vector into m codes (one per sub) using nearest L2 codeword in each sub.
     pub fn encode(&self, v: &[f32]) -> Vec<u8> {
-        debug_assert_eq!(v.len(), self.d);
         let mut codes = vec![0u8; self.m];
+        self.encode_into(v, &mut codes);
+        codes
+    }
+
+    /// `encode` into a caller-owned buffer of `m` bytes. No allocation.
+    pub fn encode_into(&self, v: &[f32], codes: &mut [u8]) {
+        debug_assert_eq!(v.len(), self.d);
+        debug_assert_eq!(codes.len(), self.m);
         for j in 0..self.m {
             let s = j * self.dsub;
             let q = &v[s..s + self.dsub];
@@ -98,7 +105,6 @@ impl ProductQuantizer {
             }
             codes[j] = best as u8;
         }
-        codes
     }
 
     // ========================== ADC LUTs ==========================
