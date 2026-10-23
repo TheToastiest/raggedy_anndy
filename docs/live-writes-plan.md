@@ -346,84 +346,158 @@ Open:
   in the log. A fixed lag after the snapshot would make the live run itself
   independent of timing, at the cost of blocking the writer if the worker is late.
 
-## Stage 4: durability
+## Stage 4: durability (built)
 
-Op log on disk, fsync once a second (up to 1 s of loss accepted), periodic
-snapshots, recovery = snapshot + log tail, full rebuild as fallback.
+Op log on disk, fsync once a second (up to 1 s of loss accepted), a
+snapshot every 60 s written beside the writer, recovery = snapshot + log
+tail, full replay on the base model as fallback, full rebuild from source
+data as the last resort. Covers the whole live system, not just the rows.
 
-Built on branch `claude/live-oplog` in three new modules (no new
-dependencies; CRC32 is in-repo). `src/live.rs` and `src/ivfpq.rs` are
-unchanged; `src/opq.rs` gained two read accessors for the snapshot.
+Brinn's answers (2026-10-23): 60 s saves; recovery is atomic per whole
+tick; the server owns the clock.
 
 | Module | What |
 | --- | --- |
-| `oplog` | record and segment-header format, CRC32, encode/decode |
-| `snapshot` | whole-index snapshot file, atomic write, verified read |
-| `durable` | writer (`create`, `append`, `apply_logged`, `end_tick`, `sync`, `snapshot`), `recover`, `resume` |
+| `system` | the writer thread's whole state: stage 2 `views::Writer` (rows, `dead_since`, directory, tick), stage 3 epoch (`epoch`, `base_seed`, `model_seq`, drift baseline and stats, pending `carry`), stage 5 `Pending` + `Outbox`; `write`, `begin_rebuild`, `swap`, `reject`, `replay_decision`, `capture`, `fingerprint` |
+| `oplog` | record and segment-header format, CRC32, tick markers, encode/decode |
+| `snapshot` | whole-system snapshot file, written from a `Capture` on any thread, verified read |
+| `durable` | writer (`create`, `write`, `swap`, `reject`, `end_tick`, `sync`, `start_snapshot`, `wait_snapshot`), `recover`, `resume` |
 
-Directory layout: `log-{start_seq:020}.log` segments and
-`snap-{seq:020}.snap` snapshots. Seq 1 is the first logged op; "state at
-S" is the index after ops 1..=S.
+Small supporting changes: `real_memory` runs on either storage
+(`Rows::{Index, Writer}`, `apply_writer`; public API unchanged); `views`
+gained `rebase` (swap a rebuilt model into the writer, keeping the query
+handle and tick), `is_current`, `block_rows`, `scratch`, `writer_index`,
+and `fingerprint` / `writer_fingerprint` now fold straight from the blocks
+(no copy, same value); `ivfpq::fingerprint_head` shares the model part.
+No new dependencies; CRC32 is in-repo.
 
-Log segment: 36-byte header (magic `RAOPLOG\0`, version, `start_seq`, the
-index fingerprint at `start_seq`, CRC32), then records `len u32 | crc32
-u32 | seq u64, tick u64, kind u8, body`, little-endian. A record counts
-only if its length fits, its CRC matches, its body parses to exactly
-`len` bytes and its seq is the previous + 1; the first one that fails ends
-the log, so a torn or corrupt tail is dropped, never mis-parsed. Every
-segment boundary is checked against the header fingerprint.
+**Log entries.** Every write is a `RealOp` (`RealOp::Live(op)` is a plain
+write, including the `Compact`s the policy issues); model decisions are
+`LogOp::SwapModel` / `RejectModel` with epoch, snapshot seq, model hash and
+the whole logged `Gate`. Record kinds: 1-5 `Insert`, `Upsert`, `Delete`,
+`Expire`, `Compact`; 6 `InsertReal`, 7 `UpsertReal`, 8 `Commit`, 9 `Ack`;
+10 `SwapModel`, 11 `RejectModel`; 12 `EndTick`. All f32/f64 are stored as
+bits. Refused writes change nothing and are not logged, so every logged
+entry succeeds on replay (a refusal on replay is `Diverged`).
 
-Writer, per tick: `apply_logged` (logs only ops the index accepted), then
-`end_tick(now)`: one `write` of the tick's records, and `fdatasync` once
-`sync_every` (default 1 s) has passed. A process crash loses at most the
-unflushed tick; a power loss at most `sync_every`.
+**Whole ticks.** Each tick ends with an `EndTick` record (tick, seq of its
+last entry, entry count, CRC32 of the entries' bytes), written for every
+tick, including empty ones (33 bytes, ~2 KB/s at 60 Hz), so ticks are
+consecutive and the writer's tick replays exactly. Recovery applies a tick
+only if its `EndTick` is there and matches; a crash part-way through
+writing a tick drops that tick entirely, whole records included. Replay
+publishes once per tick, as the live writer does.
 
-Snapshot: 56-byte header (magic `RASNAP\0\0`, version, seq, tick,
-fingerprint, payload length, payload CRC32, header CRC32), then model +
-lists + `max_ts`. The id directory is rebuilt from the lists on load
-(every row with `tomb == 0`), not stored. Written to `.tmp`, fsynced,
-renamed, directory fsynced. Load refuses it unless both CRCs, the length,
-`live::check_invariants` and the fingerprint check out. Each snapshot
-starts a new log segment; the newest `keep_snapshots` (default 2)
-snapshots are kept, and the log from the oldest of them on, so a corrupt
-newest snapshot still recovers from the one before. Until two snapshots
-exist the whole log is kept.
+Directory layout: `log-{start_tick:020}.log` segments (44-byte header:
+magic, version 2, start seq, start tick, log id, CRC32) and
+`snap-{tick:020}.snap` snapshots. Files are named by tick because seqs do
+not move on idle ticks. The log id is `system::fingerprint` of the state
+the log was created on; every segment and snapshot carries it.
 
-Recovery (`recover`, read-only): newest snapshot that verifies + the log
-from its seq; else the whole log on the caller's base model (the index the
-log was created from, checked by fingerprint); else `NoState` and the
-fallback is a full rebuild from source data. `resume` then cuts the bad
-tail off, sets bad snapshots and unreachable segments aside as
-`.corrupt`, and reopens the log at the recovered seq.
+**Writer, per tick:** `durable::write` each op (`swap` / `reject` when a
+rebuild decides), then `end_tick(now)`: applies and logs the compactions
+`views::compactions_due` says are due, writes `EndTick`, one `write` of the
+tick's records, `fdatasync` once `sync_every` (1 s) has passed on the
+caller's clock, `views::publish`, collects a finished snapshot and starts
+the next one when due.
 
-**Stage 2 note:** `snapshot::put_list` / `get_list` are the only code that
-knows the list layout. The segmented arena changes them (and bumps
-`SNAPSHOT_VERSION`); the header, atomic write, checks and the op log stay.
-The snapshot currently blocks the writer thread for the whole write; with
-stage 2 it should be written from a published view on another thread.
+**Snapshots** (`SNAPSHOT_VERSION` 2): every `snapshot_every_ticks`
+(default `SNAPSHOT_EVERY_TICKS` = 3600, 60 s at 60 Hz; pass `60 * rate`
+at another rate), counted in `end_tick` calls; no clock is read in the
+library (a test checks the source). Writer side (`start_snapshot`):
+`system::capture` takes an `Arc` of the view just published plus the
+non-row state (`dead_since`, `State`: O(lists + pending + outbox), no row
+copied), and opens the next log segment (create + header, no fsync). A
+background thread then fsyncs the old segment, streams the snapshot from
+the view's blocks (rows never move; filled slots are never rewritten),
+fsyncs, renames, fsyncs the directory and prunes. The view stays pinned
+(and so do blocks retired meanwhile) until it is done. A snapshot is
+taken only when the last publish went through (`views::is_current`), no
+snapshot is in flight, and no rebuild is pending; otherwise it is retried
+on the next tick.
 
-Tests: `tests/live_durability.rs` (12): every op variant round-trips (bytes
-and file); every truncation and every flipped byte of the last record is
-dropped; seq gaps stop replay; kill after tick T recovers the last flushed
-record (process crash) or the last fsynced one (power loss, file cut at the
-fsync point plus a torn fragment) with the live fingerprint; fsync
-interval; snapshot round-trip incl. OPQ and no raw vectors, flipped bytes
-refused; snapshot + tail equals full replay; corrupt snapshot falls back to
-full replay, wrong base refused; corrupt newest snapshot falls back to the
-older one, pruning; crash between snapshot and new segment.
+Pending rebuild rule: snapshots are only taken with no rebuild pending.
+Then every decision in the log after a snapshot names a `snapshot_seq` at
+or after it, and replay takes the rebuild's rows itself
+(`system::begin_rebuild` at that position). Simpler than storing the carry
+and the rebuild's rows, and just as deterministic. Since `due` waits
+`min_ops_per_epoch` (>= 6.8 s) after every decision, there is always a
+window. A rebuild whose decision never reached the log (crash mid-rebuild)
+is in-flight work: it is lost and the trigger fires again; `carry` is not
+part of `system::fingerprint`.
 
-Measured on the dev container, release build (`durability_timing`, ignored
-by default), 100k built rows + 100k logged inserts, 10 per tick:
+Snapshot payload: model (as v1), lists in a layout-independent column
+order (as v1, written from blocks), the writer's tick and `dead_since`,
+epoch state (seq, model_seq, epoch, base_seed, baseline, stats), pending
+buffer (columns, raw and scored vectors, handed ids sorted, next seq),
+outbox (records, next seq). 64-byte header (magic, version, seq, tick,
+`system::fingerprint`, log id, payload length, payload CRC32, header
+CRC32). The id directories are rebuilt on load. Load refuses the file
+unless both CRCs, the length, `live::check_invariants`,
+`system::check_invariants` (buffer, outbox order, `dead_since` vs dead
+counts, vector lengths) and the fingerprint check out. Block size is a
+load parameter: any size gives the same state.
 
-| dim | nlist | m | append | log | full replay of 100k ops | snapshot write / read |
-| --- | --- | --- | --- | --- | --- | --- |
-| 128 | 256 | 32 | 195k ops/s | 56.5 MB | 6.0 s | 1.3 s / 0.6 s (114 MB) |
-| 256 | 1024 | 32 | 154k ops/s | 108 MB | 19.4 s | 1.0 s / 0.8 s (218 MB) |
+**Recovery** (`recover(dir, base, block_rows, threads)`, read-only):
+newest snapshot that verifies + the segments that chain on from its
+(seq, tick, log id); else the whole log on `system::start(base)` (checked
+by log id); else `NoState`. Model decisions in the tail are replayed by
+rebuilding and re-running the gate (`system::replay_decision`, same checks
+as `rebuild::replay`: epoch, model hash, whole gate). `resume` cuts the
+bad tail (and any partial tick) off, sets bad snapshots and unreachable
+segments aside as `.corrupt`, and reopens the log.
 
-Replay is dominated by the inserts themselves (same cost as live, see
-stage 1); decoding the log alone is 0.5 to 1.0 s. Recovery time is bounded
-by the snapshot interval: at 600 ops/s, a snapshot every 5 minutes leaves at
-most ~180k ops to replay.
+Power loss: the new segment is fsynced by the writer's next periodic
+fsync, the old one by the snapshot thread right away; in the window
+between them a power loss can lose the old segment's last second and with
+it the new segment (unreachable). Still within ~1 s.
+
+Tests: `tests/live_durability.rs` (15 + timing aid): every record kind
+round-trips bit for bit (bytes, re-encoding, NaN in a gate) and through a
+log file (with policy compactions, commit, ack, handed delete); a plain
+write is never logged as a model entry; every cut and every flipped byte
+inside the last tick drops the whole tick; count, CRC, seq gap, tick gap
+and an entry of another tick are refused; kill after tick T (37, 61, 150;
+with and without OPQ) recovers the exact live state: system fingerprint,
+the published view's fingerprint, model hash, epoch, drift stats, buffer
+and outbox, for a process crash and for a power loss (file cut inside the
+next tick's `EndTick`); a torn tick at every record boundary and inside
+records is dropped whole, then resume continues; fsync interval; snapshot
+file round trip (OPQ on/off, block sizes 1/64/4096, same search results),
+flipped bytes refused; background snapshots every 6 ticks with a query
+thread running never change writer results (op by op against a plain
+system) and each holds its tick's state; cadence: snapshots start at
+ticks 3600 and 7200 with the defaults, no clock in the source; corrupt
+snapshot falls back to full replay, wrong base refused; corrupt newest
+snapshot falls back to the older one, pruning keeps two; crash before
+the snapshot file and crash before its segment; snapshot + tail equals full
+replay across a `RejectModel` (game-check veto) and a `SwapModel` (half the
+content shifted), with 2 decisions rebuilt on replay, and a tampered logged
+gate is refused.
+
+Measured on the dev container (4 cores, shared), release
+(`durability_timing`, ignored by default), 100k built rows + 100k logged
+inserts at 10 per tick, a snapshot every 1000 ticks up to tick 6000:
+
+| dim | nlist | m | snapshot writer pause | background write | snapshot size | end_tick p50 / p99 | snapshot + 40k-op tail | full replay of 100k ops | log |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 128 | 256 | 32 | 169-230 us | 0.31-0.48 s | 91 MB | 28 / 93 us | 3.8 s | 7.9 s | 57 MB |
+| 256 | 1024 | 32 | 180-228 us | 0.56-0.99 s | 174 MB | 53 / 141 us | 9.3 s | 21.3 s | 108 MB |
+
+The writer pause is the capture, opening the next segment and spawning the
+snapshot thread; it no longer grows with the rows (the stage 4 v1 snapshot
+blocked the writer for 1.0-1.3 s). Replay is dominated by the inserts
+themselves (stage 1 cost). With 60 s snapshots the tail is at most ~36k
+ops at the 10-per-tick ceiling, so recovery is the snapshot load plus at
+most ~3.5 / 8.5 s of replay (plus a rebuild per decision in the tail).
+
+Open:
+- `system::begin_rebuild` still copies the live rows on the writer thread
+  (stage 3 cost, 54-108 ms at 100k); it could read a pinned view too.
+- The merged real-memory search (`real_memory::search`) runs on an
+  `IvfPqIndex`; query threads on views do not see the pending buffer yet.
+- A swap (`views::rebase`) copies every row into new blocks on the writer
+  thread; rare, but O(rows).
 
 ## Stage 5: real memories to PostgreSQL
 
@@ -489,8 +563,8 @@ pgvector not yet confirmed):
   (`ON CONFLICT (id) DO UPDATE ... WHERE excluded.seq > row.seq`), `Delete`
   = delete by id. Skip any `seq` at or below the last applied one; then send
   `Ack { through_seq }` through the server's log.
-- Until acked, the outbox must survive a crash (or be rebuilt by replaying
-  the log, which stage 4 must do for `RealOp`).
+- Until acked, the outbox must survive a crash: stage 4 logs every `RealOp`
+  and snapshots the buffer and outbox, so recovery restores both.
 - Expiry of non-LEGENDARY rows in SQL (how long?).
 
 ## Test data
@@ -506,5 +580,5 @@ embedding model to use.
 - Embedding model, dim and metric.
 - Real average memories per tick.
 - Tag matching: any-bit vs all-bits (recommend a per-query choice).
-- Stage 5: stage 4's log must record `RealOp` (or `Op` gains its variants at
-  merge time) so recovery rebuilds the pending buffer.
+- Stage 5: done in stage 4: the log records every `RealOp` and snapshots
+  hold the buffer and outbox.

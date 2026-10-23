@@ -216,7 +216,23 @@ fn train_opq(mode: OpqMode, dim: usize, m: usize, residuals: &[Vec<f32>], sweeps
 }
 
 /// FNV-1a fold.
-#[inline] fn fnv(h: u64, x: u64) -> u64 { (h ^ x).wrapping_mul(0x100000001b3) }
+#[inline] pub(crate) fn fnv(h: u64, x: u64) -> u64 { (h ^ x).wrapping_mul(0x100000001b3) }
+
+/// The model part of `IvfPqIndex::fingerprint` (everything before the
+/// lists), so other row layouts (`views`) can fold their lists on and get
+/// the same value.
+pub(crate) fn fingerprint_head(idx: &IvfPqIndex, max_ts: u64) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    h = fnv(h, idx.dim as u64);
+    h = fnv(h, idx.params.m as u64);
+    h = fnv(h, idx.pq.nbits as u64);
+    h = fnv(h, idx.centroids.len() as u64);
+    h = fnv(h, max_ts);
+    for c in &idx.centroids { for &x in c { h = fnv(h, x.to_bits() as u64); } }
+    if let Some(o) = &idx.opq { for x in o.fingerprint_bits() { h = fnv(h, x); } }
+    for cb in &idx.pq.codebooks { for &x in cb { h = fnv(h, x.to_bits() as u64); } }
+    h
+}
 
 impl IvfPqIndex {
     // Signature updated to require (ID, Vector, Timestamp)
@@ -249,15 +265,7 @@ impl IvfPqIndex {
 
     /// FNV-1a over everything search reads: shape, centroids, OPQ, codebooks, and every list column.
     pub fn fingerprint(&self) -> u64 {
-        let mut h = 0xcbf29ce484222325u64;
-        h = fnv(h, self.dim as u64);
-        h = fnv(h, self.params.m as u64);
-        h = fnv(h, self.pq.nbits as u64);
-        h = fnv(h, self.centroids.len() as u64);
-        h = fnv(h, self.max_ts);
-        for c in &self.centroids { for &x in c { h = fnv(h, x.to_bits() as u64); } }
-        if let Some(o) = &self.opq { for x in o.fingerprint_bits() { h = fnv(h, x); } }
-        for cb in &self.pq.codebooks { for &x in cb { h = fnv(h, x.to_bits() as u64); } }
+        let mut h = fingerprint_head(self, self.max_ts);
         for l in &self.lists {
             h = fnv(h, l.len() as u64);
             h = fnv(h, l.head as u64);
