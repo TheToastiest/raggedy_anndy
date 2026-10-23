@@ -164,6 +164,36 @@ Typical good starting point (Cosine, dim=256, N≈50k, k∈{5,10}):
 * Deterministic tie‑breaks and list insertion order.
 * `fingerprint()` covers params, centroids, PQ codebooks, and per‑list ids.
 
+### Build target
+
+`.cargo/config.toml` pins x86_64 Linux builds to `-C target-cpu=x86-64-v3`
+(AVX, AVX2, BMI1/2, F16C, FMA, LZCNT, MOVBE). Other targets are unaffected.
+
+* **Why a fixed target:** determinism is promised for the *same binary and
+  CPU features*. A fixed baseline means the binary built on the dev laptop
+  (WSL Debian) and the live server (Xeon E‑2286G, Coffee Lake: AVX2 + FMA,
+  no AVX‑512) is the same code on both.
+* **Why not `target-cpu=native`:** it compiles for whatever the build host
+  has. A binary built on an AVX‑512 machine can crash (illegal instruction)
+  or take different code paths on the server, and two hosts would produce
+  two different binaries.
+* **FMA:** Rust never contracts `a*b+c` into a fused multiply‑add on its
+  own, so enabling the FMA feature does not change float results. Fingerprints
+  and top‑k id/score bits were checked identical against the default
+  `x86-64` target.
+
+Check a machine supports it before running a v3 binary there:
+
+```bash
+grep -m1 -o avx2 /proc/cpuinfo && grep -m1 -o fma /proc/cpuinfo   # both must print
+rustc --print cfg -C target-cpu=x86-64-v3 | grep target_feature  # what v3 enables
+```
+
+The server supports x86‑64‑v3. The dev laptop's support is **not yet
+confirmed**; run the check above on it. To build for an older CPU, override
+with `RUSTFLAGS="-C target-cpu=x86-64" cargo build --release` (env
+`RUSTFLAGS` takes precedence over the config file).
+
 ---
 
 ## Status
