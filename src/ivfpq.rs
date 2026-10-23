@@ -84,6 +84,14 @@ const PQ_TRAIN_ROWS: usize = 5000;
     match metric { Metric::Cosine => metric::dot(q, c), Metric::L2 => -metric::l2_distance(q, c) }
 }
 
+/// `coarse_score` of 4 centroids at once; bit-identical to 4 calls.
+#[inline] fn coarse_score_x4(metric: Metric, q: &[f32], rows: [&[f32]; 4]) -> [f32; 4] {
+    match metric {
+        Metric::Cosine => metric::dot_x4(q, rows),
+        Metric::L2 => { let d = metric::l2_distance_x4(q, rows); [-d[0], -d[1], -d[2], -d[3]] }
+    }
+}
+
 /// Coarse score of every centroid as (list, score), 4 centroids at a time.
 /// Bit-identical to `coarse_score` per centroid.
 fn coarse_scores(metric: Metric, q: &[f32], centroids: &[Vec<f32>]) -> Vec<(usize, f32)> {
@@ -93,14 +101,30 @@ fn coarse_scores(metric: Metric, q: &[f32], centroids: &[Vec<f32>]) -> Vec<(usiz
     for b in 0..blocks {
         let j = b * 4;
         let rows = [&centroids[j][..], &centroids[j + 1][..], &centroids[j + 2][..], &centroids[j + 3][..]];
-        let s = match metric {
-            Metric::Cosine => metric::dot_x4(q, rows),
-            Metric::L2 => { let d = metric::l2_distance_x4(q, rows); [-d[0], -d[1], -d[2], -d[3]] }
-        };
+        let s = coarse_score_x4(metric, q, rows);
         for t in 0..4 { out.push((j + t, s[t])); }
     }
     for j in blocks * 4..n { out.push((j, coarse_score(metric, q, &centroids[j]))); }
     out
+}
+
+/// The list a row is assigned to, shared by `build` and `live::insert`: the
+/// highest `coarse_score` over `centroid(0..nlist)`, ties to the lower list
+/// index. Scores 4 centroids at a time but compares them in list order with
+/// strictly-greater-wins, so the choice equals a one-at-a-time scan. No allocation.
+#[inline] pub(crate) fn nearest_centroid<'a>(metric: Metric, v: &[f32], nlist: usize, centroid: impl Fn(usize) -> &'a [f32]) -> usize {
+    let mut best = 0usize; let mut bs = f32::NEG_INFINITY;
+    let blocks = nlist / 4;
+    for b in 0..blocks {
+        let j = b * 4;
+        let s = coarse_score_x4(metric, v, [centroid(j), centroid(j + 1), centroid(j + 2), centroid(j + 3)]);
+        for t in 0..4 { if s[t] > bs { bs = s[t]; best = j + t; } }
+    }
+    for j in blocks * 4..nlist {
+        let sc = coarse_score(metric, v, centroid(j));
+        if sc > bs { bs = sc; best = j; }
+    }
+    best
 }
 
 /// Total order: score desc, then id asc. NaN-safe.
@@ -132,13 +156,7 @@ fn assign_rows(metric: Metric, rows: &[f32], dim: usize, centroids: &[f32], nlis
     let ranges = chunk_ranges(n);
     parallel_map_indexed(&ranges, threads, |&(s, e), _| {
         (s..e).map(|i| {
-            let v = &rows[i * dim..(i + 1) * dim];
-            let mut best = 0usize; let mut bs = f32::NEG_INFINITY;
-            for j in 0..nlist {
-                let sc = coarse_score(metric, v, &centroids[j * dim..(j + 1) * dim]);
-                if sc > bs { bs = sc; best = j; }
-            }
-            best
+            nearest_centroid(metric, &rows[i * dim..(i + 1) * dim], nlist, |j| &centroids[j * dim..(j + 1) * dim])
         }).collect::<Vec<usize>>()
     }).into_iter().flatten().collect()
 }
@@ -555,6 +573,39 @@ mod tests {
             assert_eq!(la.codes, lb.codes);
         }
         assert_eq!(a.fingerprint(), b.fingerprint());
+    }
+
+    /// The scan `nearest_centroid` replaced: one centroid at a time, strictly greater wins.
+    fn nearest_scalar(metric: Metric, v: &[f32], centroids: &[Vec<f32>]) -> usize {
+        let mut best = 0usize; let mut bs = f32::NEG_INFINITY;
+        for (j, c) in centroids.iter().enumerate() {
+            let sc = coarse_score(metric, v, c);
+            if sc > bs { bs = sc; best = j; }
+        }
+        best
+    }
+
+    /// 4-wide assignment picks the same list as the scalar scan, ties included:
+    /// duplicate centroids inside one block of 4, across blocks, and in the tail.
+    #[test]
+    fn nearest_centroid_matches_scalar_scan_including_ties() {
+        for metric in [Metric::Cosine, Metric::L2] {
+            for (dim, nlist) in [(8usize, 1usize), (8, 3), (16, 4), (16, 13), (32, 64), (30, 67)] {
+                let mut cents = sphere_rows(nlist, dim, (dim * 1000 + nlist) as u64);
+                // Exact ties: copy earlier centroids forward, within and across blocks of 4.
+                for (src, dst) in [(0usize, 1usize), (0, 5), (2, 3), (6, 11), (4, 12), (9, nlist - 1)] {
+                    if dst < nlist && src < dst { cents[dst] = cents[src].clone(); }
+                }
+                let flat: Vec<f32> = cents.concat();
+                let mut queries = sphere_rows(500, dim, 31 + nlist as u64);
+                queries.extend(cents.iter().cloned()); // a query on a duplicated centroid is a tie at the top
+                for q in &queries {
+                    let want = nearest_scalar(metric, q, &cents);
+                    assert_eq!(nearest_centroid(metric, q, nlist, |j| &cents[j][..]), want, "{metric:?} dim={dim} nlist={nlist}");
+                    assert_eq!(nearest_centroid(metric, q, nlist, |j| &flat[j * dim..(j + 1) * dim]), want);
+                }
+            }
+        }
     }
 
     #[test]
