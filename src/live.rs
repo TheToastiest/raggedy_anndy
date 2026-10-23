@@ -64,10 +64,16 @@ impl std::error::Error for WriteError {}
 
 /// Per-writer buffers so an insert does not allocate.
 #[derive(Clone, Debug)]
-pub struct Scratch { view: Vec<f32>, res: Vec<f32>, rot: Vec<f32>, codes: Vec<u8> }
+pub struct Scratch { pub(crate) view: Vec<f32>, res: Vec<f32>, rot: Vec<f32>, pub(crate) codes: Vec<u8> }
 
 pub fn scratch_for(idx: &IvfPqIndex) -> Scratch {
     Scratch { view: vec![0.0; idx.dim], res: vec![0.0; idx.dim], rot: vec![0.0; idx.dim], codes: vec![0; idx.params.m] }
+}
+
+/// The encoded vector (OPQ-rotated residual, or the residual without OPQ)
+/// and PQ codes of the last row `s` wrote. Stats hook for `drift::record`.
+pub fn last_encoded<'a>(idx: &IvfPqIndex, s: &'a Scratch) -> (&'a [f32], &'a [u8]) {
+    (if idx.opq.is_some() { &s.rot } else { &s.res }, &s.codes)
 }
 
 /// Apply one op. See `Op` for each variant's meaning.
@@ -84,10 +90,11 @@ pub fn apply(idx: &mut IvfPqIndex, s: &mut Scratch, op: &Op) -> Result<Applied, 
     }
 }
 
-fn check_row(idx: &IvfPqIndex, id: u64, ts: u64, v: &[f32]) -> Result<(), WriteError> {
-    if v.len() != idx.dim { return Err(WriteError::WrongDim { id, got: v.len(), want: idx.dim }); }
+/// Row checks shared by every write path. `max_ts` is the writer's newest timestamp.
+pub(crate) fn check_row(dim: usize, max_ts: u64, id: u64, ts: u64, v: &[f32]) -> Result<(), WriteError> {
+    if v.len() != dim { return Err(WriteError::WrongDim { id, got: v.len(), want: dim }); }
     if v.iter().any(|x| !x.is_finite()) { return Err(WriteError::NonFinite { id }); }
-    if ts < idx.max_ts { return Err(WriteError::TsBackwards { id, ts, last: idx.max_ts }); }
+    if ts < max_ts { return Err(WriteError::TsBackwards { id, ts, last: max_ts }); }
     Ok(())
 }
 
@@ -107,23 +114,31 @@ pub fn nearest_list(idx: &IvfPqIndex, v: &[f32]) -> usize {
 /// Append a new row. Cost: one centroid scan + one PQ encode, no
 /// allocation once `reserve` has made room.
 pub fn insert(idx: &mut IvfPqIndex, s: &mut Scratch, id: u64, ts: u64, tags: u64, v: &[f32]) -> Result<RowLoc, WriteError> {
-    check_row(idx, id, ts, v)?;
+    check_row(idx.dim, idx.max_ts, id, ts, v)?;
     if idx.dir.contains_key(&id) { return Err(WriteError::DuplicateId { id }); }
     Ok(append(idx, s, id, ts, tags, v))
+}
+
+/// Normalise (cosine), assign and encode `v` exactly as `build` does, with
+/// `model`'s centroids, OPQ and codebooks. Leaves the stored vector in
+/// `s.view` and the codes in `s.codes`; returns the list. No allocation.
+pub(crate) fn encode_row(model: &IvfPqIndex, s: &mut Scratch, v: &[f32]) -> usize {
+    s.view.copy_from_slice(v);
+    if matches!(model.metric, Metric::Cosine) { norm_inplace(&mut s.view); }
+    let li = nearest(model.metric, &s.view, &model.centroids);
+    for ((r, &x), &c) in s.res.iter_mut().zip(&s.view).zip(&model.centroids[li]) { *r = x - c; }
+    let to_encode: &[f32] = match &model.opq {
+        Some(o) => { o.apply_to(&s.res, &mut s.rot); &s.rot }
+        None => &s.res,
+    };
+    model.pq.encode_into(to_encode, &mut s.codes);
+    li
 }
 
 /// Writes the row; all checks already passed.
 fn append(idx: &mut IvfPqIndex, s: &mut Scratch, id: u64, ts: u64, tags: u64, v: &[f32]) -> RowLoc {
     let dim = idx.dim;
-    s.view.copy_from_slice(v);
-    if matches!(idx.metric, Metric::Cosine) { norm_inplace(&mut s.view); }
-    let li = nearest(idx.metric, &s.view, &idx.centroids);
-    for ((r, &x), &c) in s.res.iter_mut().zip(&s.view).zip(&idx.centroids[li]) { *r = x - c; }
-    let to_encode: &[f32] = match &idx.opq {
-        Some(o) => { o.apply_to(&s.res, &mut s.rot); &s.rot }
-        None => &s.res,
-    };
-    idx.pq.encode_into(to_encode, &mut s.codes);
+    let li = encode_row(idx, s, v);
 
     let list = &mut idx.lists[li];
     let loc = RowLoc { list: li as u32, row: list.ids.len() as u32 };
@@ -150,7 +165,7 @@ pub fn delete(idx: &mut IvfPqIndex, id: u64) -> Result<RowLoc, WriteError> {
 /// Delete `id` if live, then append the new row (never in place, even in
 /// the same list). Returns the new location and the replaced one.
 pub fn upsert(idx: &mut IvfPqIndex, s: &mut Scratch, id: u64, ts: u64, tags: u64, v: &[f32]) -> Result<(RowLoc, Option<RowLoc>), WriteError> {
-    check_row(idx, id, ts, v)?;
+    check_row(idx.dim, idx.max_ts, id, ts, v)?;
     let replaced = delete(idx, id).ok();
     Ok((append(idx, s, id, ts, tags, v), replaced))
 }
