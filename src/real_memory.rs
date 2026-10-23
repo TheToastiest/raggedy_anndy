@@ -41,6 +41,7 @@ use crate::ivfpq::{apply_decay, norm_inplace, IvfPqIndex, RowLoc};
 use crate::live::{self, Applied, Op, Scratch, WriteError};
 use crate::metric::{self, Metric};
 use crate::types::{stable_top_k, Hit};
+use crate::views::{self, Writer};
 
 /// Server says this memory is real: hold it until the commit.
 pub const REAL: u8 = 1 << 0;
@@ -163,6 +164,31 @@ impl From<WriteError> for RealError {
     fn from(e: WriteError) -> Self { RealError::Write(e) }
 }
 
+/// The short-term rows a real-memory op writes to: a plain index with its
+/// scratch (stage 1), or the stage 2 writer. Same results either way
+/// (`views::apply` matches `live::apply`), so the buffer and outbox rules
+/// below are written once.
+pub enum Rows<'a> {
+    Index(&'a mut IvfPqIndex, &'a mut Scratch),
+    Writer(&'a mut Writer),
+}
+
+fn rows_insert(rows: &mut Rows, id: u64, ts: u64, tags: u64, v: &[f32]) -> Result<RowLoc, WriteError> {
+    match rows { Rows::Index(idx, s) => live::insert(idx, s, id, ts, tags, v), Rows::Writer(w) => views::insert(w, id, ts, tags, v) }
+}
+
+fn rows_upsert(rows: &mut Rows, id: u64, ts: u64, tags: u64, v: &[f32]) -> Result<(RowLoc, Option<RowLoc>), WriteError> {
+    match rows { Rows::Index(idx, s) => live::upsert(idx, s, id, ts, tags, v), Rows::Writer(w) => views::upsert(w, id, ts, tags, v) }
+}
+
+fn rows_delete(rows: &mut Rows, id: u64) -> Result<RowLoc, WriteError> {
+    match rows { Rows::Index(idx, _) => live::delete(idx, id), Rows::Writer(w) => views::delete(w, id) }
+}
+
+fn rows_apply(rows: &mut Rows, op: &Op) -> Result<Applied, WriteError> {
+    match rows { Rows::Index(idx, s) => live::apply(idx, s, op), Rows::Writer(w) => views::apply(w, op) }
+}
+
 /// Empty buffer with the index's metric and dim.
 pub fn pending_for(idx: &IvfPqIndex) -> Pending {
     Pending {
@@ -175,15 +201,25 @@ pub fn pending_for(idx: &IvfPqIndex) -> Pending {
 
 /// Apply one op. See `RealOp` for each variant's meaning.
 pub fn apply(idx: &mut IvfPqIndex, s: &mut Scratch, buf: &mut Pending, outbox: &mut Outbox, op: &RealOp) -> Result<RealApplied, RealError> {
+    apply_rows(&mut Rows::Index(idx, s), buf, outbox, op)
+}
+
+/// `apply` on the stage 2 writer's rows.
+pub fn apply_writer(w: &mut Writer, buf: &mut Pending, outbox: &mut Outbox, op: &RealOp) -> Result<RealApplied, RealError> {
+    apply_rows(&mut Rows::Writer(w), buf, outbox, op)
+}
+
+/// `apply` on either storage.
+pub fn apply_rows(rows: &mut Rows, buf: &mut Pending, outbox: &mut Outbox, op: &RealOp) -> Result<RealApplied, RealError> {
     match op {
         RealOp::Live(Op::Insert { id, .. }) if is_known(buf, *id) => Err(WriteError::DuplicateId { id: *id }.into()),
-        RealOp::Live(Op::Upsert { id, ts, tags, vec }) => upsert(idx, s, buf, *id, *ts, *tags, None, vec),
-        RealOp::Live(Op::Delete { id }) => delete(idx, buf, outbox, *id),
-        RealOp::Live(op) => Ok(RealApplied::Live(live::apply(idx, s, op)?)),
+        RealOp::Live(Op::Upsert { id, ts, tags, vec }) => upsert_in(rows, buf, *id, *ts, *tags, None, vec),
+        RealOp::Live(Op::Delete { id }) => delete_in(|id| rows_delete(rows, id), buf, outbox, *id),
+        RealOp::Live(op) => Ok(RealApplied::Live(rows_apply(rows, op)?)),
         RealOp::InsertReal { id, ts, tags, flags, vec } => {
-            insert_real(idx, s, buf, *id, *ts, *tags, *flags, vec).map(|loc| RealApplied::InsertedReal { loc })
+            insert_real_in(rows, buf, *id, *ts, *tags, *flags, vec).map(|loc| RealApplied::InsertedReal { loc })
         }
-        RealOp::UpsertReal { id, ts, tags, flags, vec } => upsert(idx, s, buf, *id, *ts, *tags, Some(*flags), vec),
+        RealOp::UpsertReal { id, ts, tags, flags, vec } => upsert_in(rows, buf, *id, *ts, *tags, Some(*flags), vec),
         RealOp::Commit => Ok(RealApplied::Committed { appended: commit(buf, outbox) }),
         RealOp::Ack { through_seq } => ack(buf, outbox, *through_seq).map(|dropped| RealApplied::Acked { dropped }),
     }
@@ -202,11 +238,16 @@ fn is_known(buf: &Pending, id: u64) -> bool { buf.dir.contains_key(&id) || buf.h
 /// handed and not yet acked.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_real(idx: &mut IvfPqIndex, s: &mut Scratch, buf: &mut Pending, id: u64, ts: u64, tags: u64, flags: u8, v: &[f32]) -> Result<RowLoc, RealError> {
+    insert_real_in(&mut Rows::Index(idx, s), buf, id, ts, tags, flags, v)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_real_in(rows: &mut Rows, buf: &mut Pending, id: u64, ts: u64, tags: u64, flags: u8, v: &[f32]) -> Result<RowLoc, RealError> {
     check_flags(id, flags)?;
     if is_known(buf, id) { return Err(WriteError::DuplicateId { id }.into()); }
     // live::insert checks dim, finiteness, ts order and index duplicates,
     // and changes nothing on error; the push below cannot fail.
-    let loc = live::insert(idx, s, id, ts, tags, v)?;
+    let loc = rows_insert(rows, id, ts, tags, v)?;
     push(buf, id, ts, tags, flags, v);
     Ok(loc)
 }
@@ -218,15 +259,20 @@ pub fn insert_real(idx: &mut IvfPqIndex, s: &mut Scratch, buf: &mut Pending, id:
 /// newest), the old one, if any, is removed.
 #[allow(clippy::too_many_arguments)]
 pub fn upsert(idx: &mut IvfPqIndex, s: &mut Scratch, buf: &mut Pending, id: u64, ts: u64, tags: u64, flags: Option<u8>, v: &[f32]) -> Result<RealApplied, RealError> {
+    upsert_in(&mut Rows::Index(idx, s), buf, id, ts, tags, flags, v)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_in(rows: &mut Rows, buf: &mut Pending, id: u64, ts: u64, tags: u64, flags: Option<u8>, v: &[f32]) -> Result<RealApplied, RealError> {
     if let Some(f) = flags { check_flags(id, f)?; }
     let row = buf.dir.get(&id).map(|&r| r as usize);
     let kept = row.map(|r| buf.flags[r]).or_else(|| buf.handed.get(&id).map(|h| h.flags));
     let Some(new_flags) = flags.or(kept) else {
-        let (loc, replaced) = live::upsert(idx, s, id, ts, tags, v)?;
+        let (loc, replaced) = rows_upsert(rows, id, ts, tags, v)?;
         return Ok(RealApplied::Live(Applied::Upserted { loc, replaced }));
     };
     // live::upsert does every check before any change.
-    let (loc, replaced) = live::upsert(idx, s, id, ts, tags, v)?;
+    let (loc, replaced) = rows_upsert(rows, id, ts, tags, v)?;
     if let Some(r) = row { remove_row(buf, r); }
     push(buf, id, ts, tags, new_flags, v);
     Ok(RealApplied::UpsertedReal { loc, replaced, flags: new_flags })
@@ -237,12 +283,17 @@ pub fn upsert(idx: &mut IvfPqIndex, s: &mut Scratch, buf: &mut Pending, id: u64,
 /// outbox. A real id already expired from the index still deletes; an id
 /// that is neither real nor live is `NotFound`.
 pub fn delete(idx: &mut IvfPqIndex, buf: &mut Pending, outbox: &mut Outbox, id: u64) -> Result<RealApplied, RealError> {
+    delete_in(|id| live::delete(idx, id), buf, outbox, id)
+}
+
+/// `delete` with the index-side delete passed in (`live::delete` or `views::delete`).
+fn delete_in(mut del: impl FnMut(u64) -> Result<RowLoc, WriteError>, buf: &mut Pending, outbox: &mut Outbox, id: u64) -> Result<RealApplied, RealError> {
     let row = buf.dir.get(&id).map(|&r| r as usize);
     let handed = buf.handed.get(&id).copied();
     if row.is_none() && handed.is_none() {
-        return Ok(RealApplied::Live(Applied::Deleted { loc: live::delete(idx, id)? }));
+        return Ok(RealApplied::Live(Applied::Deleted { loc: del(id)? }));
     }
-    let loc = live::delete(idx, id).ok();
+    let loc = del(id).ok();
     let mut flags = handed.map(|h| h.flags).unwrap_or(0);
     if let Some(r) = row {
         flags = buf.flags[r];

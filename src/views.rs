@@ -62,7 +62,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 use crate::arena::Block;
-use crate::ivfpq::{search_rows, IvfPqIndex, ListRows, RowLoc, Run};
+use crate::ivfpq::{fingerprint_head, fnv, search_rows, IvfPqIndex, ListRows, RowLoc, Run};
 use crate::live::{self, Applied, Op, Scratch, WriteError};
 use crate::types::Hit;
 
@@ -555,6 +555,39 @@ pub fn arena_stats(w: &Writer) -> ArenaStats {
     }
 }
 
+/// The view in the slot holds exactly the writer's state: the last
+/// publish went through and nothing was applied since.
+pub fn is_current(w: &Writer) -> bool { w.current + 1 == w.seq && w.touched.iter().all(|&t| t <= w.current) }
+
+/// Rows per block.
+pub fn block_rows(w: &Writer) -> usize { w.pool.cap }
+
+/// The scratch the last write encoded with: `live::last_encoded(&w.model,
+/// scratch(w))` is the last inserted row's encoded vector and codes, the
+/// stats hook for `drift::record`.
+pub fn scratch(w: &Writer) -> &Scratch { &w.scratch }
+
+/// Swap in a rebuilt model (stage 3): replace the writer's model, rows and
+/// directory with `idx`'s (the caught-up rebuild), keeping the tick (`seq`)
+/// and the query handle. Queries keep the current view (old model and
+/// blocks) until the next `publish`, which shows the new model. Lists that
+/// arrive with dead rows count them as dead since this tick
+/// (`dead_since = seq`), so the compaction policy is a function of the log.
+/// O(rows) and allocates: every row is copied into new blocks once. The old
+/// pool's views and blocks are freed when the last holder drops them (the
+/// view in the slot at the next `publish`, on the writer thread).
+pub fn rebase(w: &mut Writer, idx: &IvfPqIndex) {
+    let mut n = writer_from(idx, w.pool.cap);
+    n.seq = w.seq;
+    n.dead_since = n.lists.iter().map(|l| if l.dead > 0 { w.seq } else { NEVER }).collect();
+    n.latest = w.latest.clone();
+    n.current = w.current;
+    n.pending = w.pending;
+    n.deferred = w.deferred;
+    n.grown = w.grown;
+    *w = n;
+}
+
 impl ListRows for View {
     #[inline] fn span(&self, li: usize) -> (usize, usize) { (self.lists[li].head, self.lists[li].len) }
     #[inline] fn tomb(&self, li: usize) -> &[u8] { &self.lists[li].tomb }
@@ -578,12 +611,11 @@ pub fn search_pick(v: &View, q: &[f32], k: usize, pick: usize, required_tag: Opt
     crate::pick::pick_ranked(&search_temporal(v, q, k, required_tag, current_time, lambda), pick, seed)
 }
 
-/// The view as a plain `IvfPqIndex` (rows copied into contiguous lists,
-/// directory rebuilt). O(rows); for tests, fingerprints and snapshots.
-pub fn to_index(v: &View) -> IvfPqIndex {
-    let mut idx = (*v.model).clone();
-    let cap = v.block_rows;
-    for (li, l) in v.lists.iter().enumerate() {
+/// Rows of `lists` (blocks of `cap` rows) as a plain `IvfPqIndex` with
+/// `model`'s model, directory rebuilt. O(rows).
+fn index_from(model: &IvfPqIndex, lists: &[ListMeta], cap: usize, max_ts: u64) -> IvfPqIndex {
+    let mut idx = model.clone();
+    for (li, l) in lists.iter().enumerate() {
         let out = &mut idx.lists[li];
         for r in 0..l.len {
             let (b, s) = (&l.blocks[r / cap], r % cap);
@@ -599,9 +631,42 @@ pub fn to_index(v: &View) -> IvfPqIndex {
         out.head = l.head;
         out.dead = l.dead;
     }
-    idx.max_ts = v.max_ts;
+    idx.max_ts = max_ts;
     idx
 }
 
-/// `IvfPqIndex::fingerprint` of the view's contents.
-pub fn fingerprint(v: &View) -> u64 { to_index(v).fingerprint() }
+/// The view as a plain `IvfPqIndex` (rows copied into contiguous lists,
+/// directory rebuilt). O(rows); for tests and fingerprints.
+pub fn to_index(v: &View) -> IvfPqIndex { index_from(&v.model, &v.lists, v.block_rows, v.max_ts) }
+
+/// The writer's current state (including ops of the tick not yet
+/// published) as a plain `IvfPqIndex`. O(rows); for tests.
+pub fn writer_index(w: &Writer) -> IvfPqIndex { index_from(&w.model, &w.lists, w.pool.cap, w.max_ts) }
+
+/// `IvfPqIndex::fingerprint` of `lists`, folded straight from the blocks
+/// (no copy). Same value as `index_from(..).fingerprint()`.
+fn lists_fingerprint(model: &IvfPqIndex, lists: &[ListMeta], cap: usize, max_ts: u64) -> u64 {
+    let mut h = fingerprint_head(model, max_ts);
+    for l in lists {
+        h = fnv(h, l.len as u64);
+        h = fnv(h, l.head as u64);
+        h = fnv(h, l.dead as u64);
+        let runs = || (0..l.len.div_ceil(cap)).map(move |b| l.blocks[b].rows(0, cap.min(l.len - b * cap)));
+        for r in runs() { for &id in r.ids { h = fnv(h, id); } }
+        for r in runs() { for &ts in r.ts { h = fnv(h, ts); } }
+        for &t in &l.tomb { h = fnv(h, t as u64); }
+        for r in runs() { for &c in r.codes { h = fnv(h, c as u64); } }
+        for r in runs() { for &t in r.tags { h = fnv(h, t); } }
+        if model.params.store_vecs {
+            for r in 0..l.len { for &x in l.blocks[r / cap].vec_row(r % cap) { h = fnv(h, x.to_bits() as u64); } }
+        }
+    }
+    h
+}
+
+/// `IvfPqIndex::fingerprint` of the view's contents. O(rows), no copy;
+/// safe on any thread while the view is held.
+pub fn fingerprint(v: &View) -> u64 { lists_fingerprint(&v.model, &v.lists, v.block_rows, v.max_ts) }
+
+/// `IvfPqIndex::fingerprint` of the writer's current state. O(rows), no copy.
+pub fn writer_fingerprint(w: &Writer) -> u64 { lists_fingerprint(&w.model, &w.lists, w.pool.cap, w.max_ts) }

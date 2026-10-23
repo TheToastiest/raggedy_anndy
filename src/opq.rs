@@ -18,6 +18,12 @@ impl Opq {
 
     pub fn is_identity(&self) -> bool { self.r.is_none() && self.perm.is_none() }
 
+    /// Rotation matrix (row-major, dim x dim), if any. For `snapshot`.
+    pub fn matrix(&self) -> Option<&[f32]> { self.r.as_deref() }
+
+    /// Output -> input permutation, if any. For `snapshot`.
+    pub fn permutation(&self) -> Option<&[usize]> { self.perm.as_deref() }
+
     pub fn with_matrix(mut self, r: Vec<f32>) -> Self {
         assert_eq!(r.len(), self.dim * self.dim); self.r = Some(r); self
     }

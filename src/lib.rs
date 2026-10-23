@@ -15,6 +15,8 @@
 //! - `rebuild`: snapshot, next-epoch rebuild, catch-up and logged model swap.
 //! - `gate`: deterministic offline check that a rebuilt model beats the current one.
 //! - `views`: one writer thread publishing per-tick views to query threads (`arena`: the row blocks).
+//! - `system`: the writer thread's whole state (stages 2, 3, 5) that the log replays.
+//! - `oplog`, `snapshot`, `durable`: op log on disk, background snapshots, recovery of a `system`.
 
 pub mod metric;
 pub mod types;
@@ -42,6 +44,10 @@ pub mod rebuild;
 pub mod gate;
 pub mod arena;
 pub mod views;
+pub mod system;
+pub mod oplog;
+pub mod snapshot;
+pub mod durable;
 pub use ivfpq::{IvfPqIndex, IvfPqParams, RowLoc};
 // src/lib.rs
 pub use context::{
