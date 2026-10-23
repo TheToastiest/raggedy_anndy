@@ -353,9 +353,71 @@ snapshots, recovery = snapshot + log tail, full rebuild as fallback.
 
 ## Stage 5: real memories to PostgreSQL
 
-`Insert` gains a server-set `real` flag. Real memories stay searchable in a
-small pending buffer until the 12-hour commit to SQL, then leave RAM.
-LEGENDARY is a separate flag that never expires in SQL.
+Index side built in `src/real_memory.rs` (branch `claude/live-real-memory`);
+the SQL side is not started. The game server decides what is real
+(endgame-only: meteors, black holes, specialization relics, legendary
+achievements) and flags it at insert time. No automatic importance or
+touch thresholds.
+
+The gap it closes: a real memory leaves the 1-hour window but is not
+committed for up to 12 hours. Each real memory goes into the short-term
+index like any row and also into a pending buffer (`Pending`: SoA columns,
+raw f32 vector, exact Flat scoring) until `commit` takes it.
+
+| Item | Shape |
+| --- | --- |
+| Flags | `flags: u8`, own field, never a tag bit. `REAL = 1` required; `LEGENDARY = 2` only with `REAL`; other bits rejected (`BadFlags`). |
+| Insert | `insert_real(idx, s, buf, id, ts, tags, flags, v)`, or `RealOp::InsertReal` through `real_memory::apply`. Same checks as `live::insert`, plus the id must not be pending or handed. `Op::Insert` is unchanged, so stage-1 callers and logs keep working. |
+| Ops | `RealOp { Live(Op), InsertReal, UpsertReal, Commit, Ack }`. `Live` is `live::apply` on the index; for a pending or handed id, `Delete`/`Upsert` also update the buffer (below) and `Insert` is refused. |
+| Delete | Pending id: its pending row is dropped and is never committed. Works after the 1-hour expiry too (index row already gone). Handed id: a `Delete` record is appended to the outbox at once, after the id's `Put`. |
+| Upsert | Pending id: the pending row is replaced (removed, the new one appended; its ts is the newest), so the commit carries the latest version. Handed id: the new version becomes pending again and the next commit appends a newer `Put`. `Op::Upsert` carries no flags, so the row keeps its flags: LEGENDARY is never dropped by accident. `RealOp::UpsertReal { flags }` sets the flags explicitly (can add or drop LEGENDARY, or promote a normal row to real; `REAL` still required). |
+| Search | `search(idx, buf, q, k, tag, now, lambda)`: index top `k + pending` minus pending ids, plus every pending row scored exactly with the same score and decay as the index re-rank; top-k by (score desc, id asc), each id once. Handed rows are not in RAM. |
+| Commit | `RealOp::Commit` / `commit(buf, outbox)`: drains the buffer into the outbox as `Put` records in (ts, id) order, marks each id handed, returns how many it appended. Does not touch the short-term index. |
+| Ack | `RealOp::Ack { through_seq }`: the SQL side has every record up to `through_seq`. Drops them from the outbox and forgets those handed ids (unless a later `Put` is unacked). Ack of a `seq` not yet emitted is `AckAhead`. |
+| Outbox | `Outbox { records: Vec<RealRecord>, next_seq }`, `RealRecord { seq, kind: Put \| Delete, id, ts, tags, flags, vec }`, plain data. `seq` comes from one counter in `Pending` (`next_seq`), so a replay from a snapshot emits the same `seq`s and the outbox skips any it already took: a commit re-run after a crash appends nothing. |
+
+The server owns the clock (Brinn, 2026-10-23): the 12-hour commit and the
+ack are ops the server sends, applied in log order. Nothing in
+`real_memory.rs` or `live.rs` reads a clock or runs a timer; tests pin both
+the behaviour (48 h of inserts and expiry without `Commit` commit nothing)
+and the source (no `SystemTime`, `Instant`, `sleep`, `spawn`).
+
+"Handed" means committed and not yet acked, and it is log state, not a
+peek at the outbox: the ack is an op so that replay decides delete/upsert
+of a committed id the same way every time. After the ack this side forgets
+the id; deleting or changing an acked long-term memory is the SQL side's
+job.
+
+Why a separate op, not a flag on `Op::Insert`: adding a field would change
+every stage-1 caller and the op shape stages 2-4 are building on; the real
+path also needs the pending buffer, which `live::apply` does not take.
+
+Tests: `tests/live_real_memory.rs` (22): survives expiry until commit; gone
+from RAM and once in the outbox after; deterministic commit order and
+contents; a commit re-run after a crash appends nothing; LEGENDARY
+independent of tag bits; bad flags and index errors change nothing; merged
+search deterministic, no repeated ids, tag filter on pending rows, pending
+scores bit-equal to the index re-rank; delete of a pending id (before and
+after expiry) never commits it; upsert of a pending id commits the latest
+version and keeps LEGENDARY; `UpsertReal` sets flags; delete of a handed id
+appends a `Delete` after its `Put`; upsert of a handed id commits a newer
+`Put`; ack ahead refused; a seeded churn log (inserts, deletes, upserts,
+expiry, commits, acks) replays identically and a tail replayed from a
+snapshot appends nothing; no commit without the op; no clock in the write
+path.
+
+What the SQL side needs to decide and build (no Postgres dependency here;
+pgvector not yet confirmed):
+- Schema and client. A record holds `seq u64`, `kind`, `id u64` (Postgres
+  has no unsigned bigint: store as `bigint` bit-cast or `numeric`), `ts u64`
+  (unit is the server's), `tags u64`, `flags u8`, `vec f32 x dim`.
+- Apply records in `seq` order: `Put` = insert or update the row
+  (`ON CONFLICT (id) DO UPDATE ... WHERE excluded.seq > row.seq`), `Delete`
+  = delete by id. Skip any `seq` at or below the last applied one; then send
+  `Ack { through_seq }` through the server's log.
+- Until acked, the outbox must survive a crash (or be rebuilt by replaying
+  the log, which stage 4 must do for `RealOp`).
+- Expiry of non-LEGENDARY rows in SQL (how long?).
 
 ## Test data
 
@@ -370,3 +432,5 @@ embedding model to use.
 - Embedding model, dim and metric.
 - Real average memories per tick.
 - Tag matching: any-bit vs all-bits (recommend a per-query choice).
+- Stage 5: stage 4's log must record `RealOp` (or `Op` gains its variants at
+  merge time) so recovery rebuilds the pending buffer.
