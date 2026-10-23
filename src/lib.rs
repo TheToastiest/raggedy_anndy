@@ -10,6 +10,7 @@
 //! - `eval`: recall@k + determinism check.
 //! - `pick`: seeded pick of 2 of the top 5 for URIEL.
 //! - `live`: deterministic insert / delete / upsert / expire / compact for IVF-PQ.
+//! - `views`: one writer thread publishing per-tick views to query threads (`arena`: the row blocks).
 
 pub mod metric;
 pub mod types;
@@ -31,6 +32,8 @@ pub mod recall;
 pub mod curve;
 pub mod pick;
 pub mod live;
+pub mod arena;
+pub mod views;
 pub use ivfpq::{IvfPqIndex, IvfPqParams, RowLoc};
 // src/lib.rs
 pub use context::{
