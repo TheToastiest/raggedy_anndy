@@ -10,6 +10,11 @@
 //! - `eval`: recall@k + determinism check.
 //! - `pick`: seeded pick of 2 of the top 5 for URIEL.
 //! - `live`: deterministic insert / delete / upsert / expire / compact for IVF-PQ.
+//! - `real_memory`: pending buffer for server-flagged real memories until the 12-hour commit.
+//! - `drift`: per-list drift stats and rebuild signals for a live IVF-PQ index.
+//! - `rebuild`: snapshot, next-epoch rebuild, catch-up and logged model swap.
+//! - `gate`: deterministic offline check that a rebuilt model beats the current one.
+//! - `views`: one writer thread publishing per-tick views to query threads (`arena`: the row blocks).
 //! - `oplog`, `snapshot`, `durable`: op log on disk, snapshots, recovery for `live`.
 
 pub mod metric;
@@ -32,6 +37,12 @@ pub mod recall;
 pub mod curve;
 pub mod pick;
 pub mod live;
+pub mod real_memory;
+pub mod drift;
+pub mod rebuild;
+pub mod gate;
+pub mod arena;
+pub mod views;
 pub mod oplog;
 pub mod snapshot;
 pub mod durable;
