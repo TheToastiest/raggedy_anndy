@@ -5,16 +5,29 @@
 //! at insert time with `flags`. A real memory is written to the short-term
 //! index like any other row, and also kept here, in RAM, with its f32
 //! vector, so it stays searchable (exactly, Flat) after the 1-hour expiry
-//! takes it out of the index. `commit` drains the buffer into an outbox of
-//! plain `RealRecord`s for the SQL side, which is not part of this crate.
+//! takes it out of the index. `RealOp::Commit` drains the buffer into an
+//! `Outbox` of plain `RealRecord`s for the SQL side, which is not part of
+//! this crate; `RealOp::Ack` tells this side the SQL writer has them.
+//!
+//! The server owns the clock: there is no timer and no wall-clock read
+//! here. Commit and ack happen only when the server sends the op, and are
+//! applied in log order like every other write.
 //!
 //! Rules the functions here keep:
 //! - `flags` is its own field, never one of the 64 tag bits. `REAL` must be
 //!   set; `LEGENDARY` (never expires in SQL) is a stricter subset of real.
-//! - Every check happens before any change: an `Err` leaves the index and
-//!   the buffer as they were.
-//! - Commit order is (ts asc, id asc), and a commit never appends an id the
-//!   outbox already holds, so re-running it after a crash adds nothing.
+//! - Every check happens before any change: an `Err` leaves the index, the
+//!   buffer and the outbox as they were.
+//! - Delete of a pending id drops its pending row: it is never committed.
+//!   Upsert of a pending id replaces its pending row (the latest version is
+//!   what gets committed) and keeps its flags; `UpsertReal` sets them.
+//! - An id committed but not yet acked is "handed". Delete of a handed id
+//!   appends a `Delete` record to the outbox at once; upsert of a handed id
+//!   makes it pending again, so the next commit appends a newer `Put`.
+//! - Every record carries `seq`, from one counter in `Pending`. The outbox
+//!   skips a record whose `seq` it has already taken, so replaying ops from
+//!   a snapshot (e.g. a commit re-run after a crash) appends nothing twice.
+//! - Commit order is (ts asc, id asc).
 //! - Merged search ranks by (score desc, id asc) and returns each id once.
 //!   For an id in both the index and the buffer, the buffer's exact score
 //!   is used (equal bits to the index's re-rank when it stores vectors).
@@ -22,7 +35,7 @@
 //! Long-term memories are not indexed here; another component reads them
 //! with SQL at query time.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::ivfpq::{apply_decay, norm_inplace, IvfPqIndex, RowLoc};
 use crate::live::{self, Applied, Op, Scratch, WriteError};
@@ -35,8 +48,18 @@ pub const REAL: u8 = 1 << 0;
 pub const LEGENDARY: u8 = 1 << 1;
 const KNOWN: u8 = REAL | LEGENDARY;
 
-/// Real memories not yet committed. Columns side by side (SoA), rows in
-/// insert order, so `timestamps` never decreases.
+/// A committed id the SQL side has not acked yet: its flags and the `seq`
+/// of its latest `Put`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Handed {
+    pub flags: u8,
+    pub seq: u64,
+}
+
+/// Real memories not yet committed, plus what this side must remember about
+/// committed ones until they are acked. Columns side by side (SoA), rows in
+/// insert order, so `timestamps` never decreases. All of it is rebuilt by
+/// replaying the op log.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pending {
     pub metric: Metric,
@@ -51,12 +74,28 @@ pub struct Pending {
     pub view: Vec<f32>,
     /// id -> row. Lookup only: never iterated.
     pub dir: HashMap<u64, u32>,
+    /// Committed, not yet acked. Lookup and `retain` only.
+    pub handed: HashMap<u64, Handed>,
+    /// `seq` of the next record this side emits.
+    pub next_seq: u64,
 }
 
-/// One committed real memory, for the SQL writer. `id` is the key the
-/// SQL side deduplicates on (`ON CONFLICT (id) DO NOTHING`).
+/// What a record asks the SQL side to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordKind {
+    /// Insert, or replace the row with a lower `seq`.
+    Put,
+    /// Remove the row. Only `seq`, `id` and `flags` (the deleted row's)
+    /// are meaningful; `ts` and `tags` are 0 and `vec` is empty.
+    Delete,
+}
+
+/// One change for the SQL writer, plain data. Apply in `seq` order; a
+/// record with a `seq` at or below the last one applied is a resend.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RealRecord {
+    pub seq: u64,
+    pub kind: RecordKind,
     pub id: u64,
     pub ts: u64,
     pub tags: u64,
@@ -64,23 +103,46 @@ pub struct RealRecord {
     pub vec: Vec<f32>,
 }
 
-/// A write that may touch the pending buffer. `Live` ops behave exactly as
-/// `live::apply`, except that `Insert` of a still-pending id is refused.
+/// Records handed to the SQL side and not yet acked, in `seq` order.
+/// `next_seq` is one past the highest `seq` ever taken, so acked and
+/// trimmed records are still known and a replay cannot re-add them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Outbox {
+    pub records: Vec<RealRecord>,
+    pub next_seq: u64,
+}
+
+/// A write that may touch the pending buffer. `Live` ops behave as
+/// `live::apply` on the index; for a pending or handed id they also update
+/// the buffer (see the module rules), and `Insert` of such an id is refused.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RealOp {
     Live(Op),
     /// New real memory: a short-term row plus a pending row.
     InsertReal { id: u64, ts: u64, tags: u64, flags: u8, vec: Vec<f32> },
-    /// Drain the pending buffer into the outbox.
+    /// Upsert with explicit flags: the row becomes (or stays) a real memory
+    /// with exactly these flags, whatever it was before.
+    UpsertReal { id: u64, ts: u64, tags: u64, flags: u8, vec: Vec<f32> },
+    /// Drain the pending buffer into the outbox. Sent by the server.
     Commit,
+    /// The SQL side has every record with `seq <= through_seq`.
+    Ack { through_seq: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RealApplied {
     Live(Applied),
     InsertedReal { loc: RowLoc },
-    /// Records appended to the outbox (ids already there are skipped).
+    /// A pending or handed id was upserted, or `UpsertReal` ran. `flags`
+    /// is what the pending row now carries.
+    UpsertedReal { loc: RowLoc, replaced: Option<RowLoc>, flags: u8 },
+    /// A pending or handed id was deleted. `loc` is the index row, if it
+    /// was still live; `outboxed` is true if a `Delete` record was emitted.
+    DeletedReal { loc: Option<RowLoc>, was_pending: bool, outboxed: bool },
+    /// Records appended to the outbox (records it already took are skipped).
     Committed { appended: usize },
+    /// Outbox records dropped by the ack.
+    Acked { dropped: usize },
 }
 
 /// Why a write was refused. Nothing was changed.
@@ -88,6 +150,8 @@ pub enum RealApplied {
 pub enum RealError {
     Write(WriteError),
     BadFlags { id: u64, flags: u8 },
+    /// Ack of a `seq` this side has not emitted.
+    AckAhead { through_seq: u64, next_seq: u64 },
 }
 
 impl std::fmt::Display for RealError {
@@ -105,22 +169,23 @@ pub fn pending_for(idx: &IvfPqIndex) -> Pending {
         metric: idx.metric, dim: idx.dim,
         ids: Vec::new(), timestamps: Vec::new(), tags: Vec::new(), flags: Vec::new(),
         raw: Vec::new(), view: Vec::new(), dir: HashMap::new(),
+        handed: HashMap::new(), next_seq: 0,
     }
 }
 
 /// Apply one op. See `RealOp` for each variant's meaning.
-pub fn apply(idx: &mut IvfPqIndex, s: &mut Scratch, buf: &mut Pending, outbox: &mut Vec<RealRecord>, op: &RealOp) -> Result<RealApplied, RealError> {
+pub fn apply(idx: &mut IvfPqIndex, s: &mut Scratch, buf: &mut Pending, outbox: &mut Outbox, op: &RealOp) -> Result<RealApplied, RealError> {
     match op {
-        RealOp::Live(op) => {
-            if let Op::Insert { id, .. } = op {
-                if buf.dir.contains_key(id) { return Err(WriteError::DuplicateId { id: *id }.into()); }
-            }
-            Ok(RealApplied::Live(live::apply(idx, s, op)?))
-        }
+        RealOp::Live(Op::Insert { id, .. }) if is_known(buf, *id) => Err(WriteError::DuplicateId { id: *id }.into()),
+        RealOp::Live(Op::Upsert { id, ts, tags, vec }) => upsert(idx, s, buf, *id, *ts, *tags, None, vec),
+        RealOp::Live(Op::Delete { id }) => delete(idx, buf, outbox, *id),
+        RealOp::Live(op) => Ok(RealApplied::Live(live::apply(idx, s, op)?)),
         RealOp::InsertReal { id, ts, tags, flags, vec } => {
             insert_real(idx, s, buf, *id, *ts, *tags, *flags, vec).map(|loc| RealApplied::InsertedReal { loc })
         }
+        RealOp::UpsertReal { id, ts, tags, flags, vec } => upsert(idx, s, buf, *id, *ts, *tags, Some(*flags), vec),
         RealOp::Commit => Ok(RealApplied::Committed { appended: commit(buf, outbox) }),
+        RealOp::Ack { through_seq } => ack(buf, outbox, *through_seq).map(|dropped| RealApplied::Acked { dropped }),
     }
 }
 
@@ -129,17 +194,67 @@ fn check_flags(id: u64, flags: u8) -> Result<(), RealError> {
     Ok(())
 }
 
+/// Pending, or committed and not yet acked.
+fn is_known(buf: &Pending, id: u64) -> bool { buf.dir.contains_key(&id) || buf.handed.contains_key(&id) }
+
 /// Insert a real memory: a short-term index row (same as `live::insert`)
-/// and a pending row. Fails if `id` is live in the index or still pending.
+/// and a pending row. Fails if `id` is live in the index, pending, or
+/// handed and not yet acked.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_real(idx: &mut IvfPqIndex, s: &mut Scratch, buf: &mut Pending, id: u64, ts: u64, tags: u64, flags: u8, v: &[f32]) -> Result<RowLoc, RealError> {
     check_flags(id, flags)?;
-    if buf.dir.contains_key(&id) { return Err(WriteError::DuplicateId { id }.into()); }
+    if is_known(buf, id) { return Err(WriteError::DuplicateId { id }.into()); }
     // live::insert checks dim, finiteness, ts order and index duplicates,
     // and changes nothing on error; the push below cannot fail.
     let loc = live::insert(idx, s, id, ts, tags, v)?;
     push(buf, id, ts, tags, flags, v);
     Ok(loc)
+}
+
+/// Upsert in the index, and in the buffer if the id is real. `flags`
+/// `Some` sets them (and makes any id real); `None` keeps the flags of the
+/// pending or handed row, or, for an id that is neither, is a plain
+/// `live::upsert`. The new pending row goes at the end (its ts is the
+/// newest), the old one, if any, is removed.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert(idx: &mut IvfPqIndex, s: &mut Scratch, buf: &mut Pending, id: u64, ts: u64, tags: u64, flags: Option<u8>, v: &[f32]) -> Result<RealApplied, RealError> {
+    if let Some(f) = flags { check_flags(id, f)?; }
+    let row = buf.dir.get(&id).map(|&r| r as usize);
+    let kept = row.map(|r| buf.flags[r]).or_else(|| buf.handed.get(&id).map(|h| h.flags));
+    let Some(new_flags) = flags.or(kept) else {
+        let (loc, replaced) = live::upsert(idx, s, id, ts, tags, v)?;
+        return Ok(RealApplied::Live(Applied::Upserted { loc, replaced }));
+    };
+    // live::upsert does every check before any change.
+    let (loc, replaced) = live::upsert(idx, s, id, ts, tags, v)?;
+    if let Some(r) = row { remove_row(buf, r); }
+    push(buf, id, ts, tags, new_flags, v);
+    Ok(RealApplied::UpsertedReal { loc, replaced, flags: new_flags })
+}
+
+/// Delete in the index, and in the buffer if the id is real: a pending row
+/// is dropped (never committed), a handed id gets a `Delete` record in the
+/// outbox. A real id already expired from the index still deletes; an id
+/// that is neither real nor live is `NotFound`.
+pub fn delete(idx: &mut IvfPqIndex, buf: &mut Pending, outbox: &mut Outbox, id: u64) -> Result<RealApplied, RealError> {
+    let row = buf.dir.get(&id).map(|&r| r as usize);
+    let handed = buf.handed.get(&id).copied();
+    if row.is_none() && handed.is_none() {
+        return Ok(RealApplied::Live(Applied::Deleted { loc: live::delete(idx, id)? }));
+    }
+    let loc = live::delete(idx, id).ok();
+    let mut flags = handed.map(|h| h.flags).unwrap_or(0);
+    if let Some(r) = row {
+        flags = buf.flags[r];
+        remove_row(buf, r);
+    }
+    if handed.is_some() {
+        buf.handed.remove(&id);
+        let rec = RealRecord { seq: buf.next_seq, kind: RecordKind::Delete, id, ts: 0, tags: 0, flags, vec: Vec::new() };
+        buf.next_seq += 1;
+        emit(outbox, rec);
+    }
+    Ok(RealApplied::DeletedReal { loc, was_pending: row.is_some(), outboxed: handed.is_some() })
 }
 
 fn push(buf: &mut Pending, id: u64, ts: u64, tags: u64, flags: u8, v: &[f32]) {
@@ -154,25 +269,62 @@ fn push(buf: &mut Pending, id: u64, ts: u64, tags: u64, flags: u8, v: &[f32]) {
     if matches!(buf.metric, Metric::Cosine) { norm_inplace(&mut buf.view[start..]); }
 }
 
-/// Move every pending row into `outbox` in (ts asc, id asc) order, skipping
-/// ids `outbox` already holds, and empty the buffer. Returns how many
-/// records were appended. Running it again on a buffer rebuilt by replay
-/// appends nothing new to the same outbox.
-pub fn commit(buf: &mut Pending, outbox: &mut Vec<RealRecord>) -> usize {
+/// Remove row `r`, keeping the others in order (so `timestamps` stays
+/// sorted), and repoint the directory for the rows after it. O(pending);
+/// the buffer holds only endgame events, so it is small.
+fn remove_row(buf: &mut Pending, r: usize) {
+    let dim = buf.dim;
+    buf.dir.remove(&buf.ids[r]);
+    buf.ids.remove(r);
+    buf.timestamps.remove(r);
+    buf.tags.remove(r);
+    buf.flags.remove(r);
+    buf.raw.drain(r * dim..(r + 1) * dim);
+    buf.view.drain(r * dim..(r + 1) * dim);
+    for (i, id) in buf.ids.iter().enumerate().skip(r) { buf.dir.insert(*id, i as u32); }
+}
+
+/// Append `rec` unless the outbox already took its `seq`. Returns whether
+/// it was appended.
+fn emit(outbox: &mut Outbox, rec: RealRecord) -> bool {
+    if rec.seq < outbox.next_seq { return false; }
+    outbox.next_seq = rec.seq + 1;
+    outbox.records.push(rec);
+    true
+}
+
+/// Move every pending row into `outbox` as a `Put`, in (ts asc, id asc)
+/// order, each with the next `seq`; mark each id handed and empty the
+/// buffer. Returns how many records were appended: a re-run from a buffer
+/// restored to before the commit appends nothing to the same outbox.
+pub fn commit(buf: &mut Pending, outbox: &mut Outbox) -> usize {
     let dim = buf.dim;
     let mut order: Vec<usize> = (0..buf.ids.len()).collect();
     order.sort_unstable_by_key(|&r| (buf.timestamps[r], buf.ids[r]));
-    let seen: HashSet<u64> = outbox.iter().map(|r| r.id).collect();
-    let before = outbox.len();
+    let mut appended = 0;
     for r in order {
-        if seen.contains(&buf.ids[r]) { continue; }
-        outbox.push(RealRecord {
-            id: buf.ids[r], ts: buf.timestamps[r], tags: buf.tags[r], flags: buf.flags[r],
+        let seq = buf.next_seq;
+        buf.next_seq += 1;
+        buf.handed.insert(buf.ids[r], Handed { flags: buf.flags[r], seq });
+        let rec = RealRecord {
+            seq, kind: RecordKind::Put, id: buf.ids[r], ts: buf.timestamps[r], tags: buf.tags[r], flags: buf.flags[r],
             vec: buf.raw[r * dim..(r + 1) * dim].to_vec(),
-        });
+        };
+        appended += emit(outbox, rec) as usize;
     }
     clear(buf);
-    outbox.len() - before
+    appended
+}
+
+/// The SQL side has every record with `seq <= through_seq`: forget those
+/// handed ids (unless a later `Put` is still unacked) and drop those
+/// records from the outbox. Returns how many records were dropped.
+pub fn ack(buf: &mut Pending, outbox: &mut Outbox, through_seq: u64) -> Result<usize, RealError> {
+    if through_seq >= buf.next_seq { return Err(RealError::AckAhead { through_seq, next_seq: buf.next_seq }); }
+    buf.handed.retain(|_, h| h.seq > through_seq);
+    let before = outbox.records.len();
+    outbox.records.retain(|r| r.seq > through_seq);
+    Ok(before - outbox.records.len())
 }
 
 fn clear(buf: &mut Pending) {
@@ -188,6 +340,9 @@ fn clear(buf: &mut Pending) {
 pub fn pending_len(buf: &Pending) -> usize { buf.ids.len() }
 
 pub fn is_pending(buf: &Pending, id: u64) -> bool { buf.dir.contains_key(&id) }
+
+/// Committed and not yet acked.
+pub fn is_handed(buf: &Pending, id: u64) -> bool { buf.handed.contains_key(&id) }
 
 /// `Some(true)` if `id` is pending and LEGENDARY, `None` if not pending.
 pub fn is_legendary(buf: &Pending, id: u64) -> Option<bool> {
@@ -240,5 +395,9 @@ pub fn check_invariants(buf: &Pending) -> Result<(), String> {
     }
     if buf.timestamps.windows(2).any(|w| w[0] > w[1]) { return Err("timestamps not sorted".into()); }
     if buf.raw.iter().any(|x| !x.is_finite()) { return Err("non-finite vector".into()); }
+    for (id, h) in &buf.handed {
+        if h.seq >= buf.next_seq { return Err(format!("handed id {id}: seq {} not below next_seq {}", h.seq, buf.next_seq)); }
+        if check_flags(*id, h.flags).is_err() { return Err(format!("handed id {id}: bad flags {:#b}", h.flags)); }
+    }
     Ok(())
 }
