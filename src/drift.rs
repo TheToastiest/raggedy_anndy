@@ -55,11 +55,24 @@ pub struct Thresholds {
     /// The two ratios are not checked before this many inserts this epoch:
     /// one row's error says little about the distribution.
     pub min_inserts: u64,
+    /// No new rebuild starts until this many logged writes have been applied
+    /// since the last model decision (swap or reject; epoch 0 counts from
+    /// the start). Signals are still measured; `rebuild::due` holds them.
+    /// Counted in ops, not time, so the trigger lands at the same op on
+    /// every run.
+    pub min_ops_per_epoch: u64,
 }
 
-/// Starting thresholds from the design: 1.5, 1.5, 4.0, 0.5.
+/// Starting thresholds from the design: 1.5, 1.5, 4.0, 0.5, 256 inserts.
+/// `min_ops_per_epoch` 4096 = 16 x `min_inserts`: the next epoch's ratios
+/// are then means over >= ~4k rows (a quarter of the 256-row noise), and a
+/// shift that is still arriving gets 4k ops into the new model before it can
+/// ask again (the test shift re-fired every ~320 ops without it). At the
+/// 10 writes per tick ceiling that is >= 6.8 s at 60 Hz, about one 100k-row
+/// rebuild (9 s on the dev container), so at most one rebuild runs at a time
+/// without the worker falling behind.
 pub fn default_thresholds() -> Thresholds {
-    Thresholds { qerr_ratio: 1.5, rnorm_ratio: 1.5, imbalance: 4.0, churn: 0.5, min_inserts: 256 }
+    Thresholds { qerr_ratio: 1.5, rnorm_ratio: 1.5, imbalance: 4.0, churn: 0.5, min_inserts: 256, min_ops_per_epoch: 4096 }
 }
 
 /// Bits of `Signals::fired`.

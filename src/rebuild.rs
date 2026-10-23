@@ -19,31 +19,44 @@
 //! `max_ts`). Inserts, upserts and deletes carry as they are.
 //!
 //! The new model depends only on the snapshot (that is, on the log up to
-//! `snapshot_seq`), never on when the worker finishes. Where the swap lands
+//! `snapshot_seq`), never on when the worker finishes. Before a swap the
+//! worker runs the swap gate on it (`gate::evaluate`, also a pure function of
+//! the snapshot): a candidate that is not better is dropped with `reject`,
+//! which logs a `RejectModel` entry and keeps the old model. Where the swap lands
 //! is up to the writer and is recorded in the log, so `replay` of a log that
 //! contains `SwapModel` entries rebuilds the same model at the same place
 //! and ends in the same state, byte for byte.
 //!
 //! Positions: `seq` counts log entries applied. A snapshot at `seq = s` sees
 //! entries `log[..s]`; the carry covers `log[s..]` up to the swap. A
-//! `SwapModel` entry takes one position like any other.
+//! `SwapModel` or `RejectModel` entry takes one position like any other.
+//!
+//! Cadence: `due` holds a fired signal until `Thresholds::min_ops_per_epoch`
+//! writes have been applied since the last swap or reject. Triggers are
+//! not logged (the decision entries name their `snapshot_seq`), so the
+//! trigger policy, e.g. later hysteresis, can change without changing the
+//! log format or replay.
 
 use std::collections::BTreeMap;
 
-use crate::drift::{self, DriftBaseline, DriftStats};
+use crate::drift::{self, DriftBaseline, DriftStats, Signals, Thresholds};
+use crate::gate::{self, Gate};
 use crate::ivfpq::{build_with_threads, IvfPqIndex, IvfPqParams};
 use crate::live::{self, Applied, Op, Scratch, WriteError};
 use crate::metric::Metric;
 use crate::seed::SplitMix64;
 
-/// One log entry: a write, or the swap to the next epoch's model.
+/// One log entry: a write, or a decision on a rebuilt model.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LogOp {
     Write(Op),
     /// Replace the model with the one trained from the snapshot at
-    /// `snapshot_seq`, caught up to this entry. `model_hash` is checked on
-    /// replay.
-    SwapModel { epoch: u64, snapshot_seq: u64, model_hash: u64 },
+    /// `snapshot_seq`, caught up to this entry. `model_hash` and `gate`
+    /// (which accepted it) are checked on replay.
+    SwapModel { epoch: u64, snapshot_seq: u64, model_hash: u64, gate: Gate },
+    /// The model trained from the snapshot at `snapshot_seq` lost the gate
+    /// and was dropped; the old model stays. Checked on replay like a swap.
+    RejectModel { epoch: u64, snapshot_seq: u64, model_hash: u64, gate: Gate },
 }
 
 /// Why a rebuild, swap or replay was refused. Nothing was changed.
@@ -64,8 +77,14 @@ pub enum RebuildError {
     /// means the two indexes disagree on the live set.
     CarryRefused { at: usize, err: WriteError },
     HashMismatch { seq: u64, logged: u64, rebuilt: u64 },
-    /// The `SwapModel` at `seq` names a snapshot position not before it.
+    /// The decision entry at `seq` names a snapshot position not before it.
     BadSnapshotSeq { seq: u64, snapshot_seq: u64 },
+    /// The gate runs on the rebuild as built; this one has applied `carried` ops.
+    GateAfterCatchUp { carried: usize },
+    /// `swap` with a rejecting gate, or `reject` with an accepting one.
+    GateDecision { accept: bool },
+    /// The gate recomputed on replay differs from the logged one.
+    GateMismatch { seq: u64 },
 }
 
 impl std::fmt::Display for RebuildError {
@@ -80,6 +99,9 @@ pub struct Live {
     pub scratch: Scratch,
     /// Log entries applied so far.
     pub seq: u64,
+    /// `seq` just after the last `SwapModel` or `RejectModel`; 0 in epoch 0
+    /// until the first decision. `due` counts ops from here.
+    pub model_seq: u64,
     pub epoch: u64,
     /// Seed of epoch 0; every epoch's seed derives from it.
     pub base_seed: u64,
@@ -97,11 +119,15 @@ pub struct Carry {
     pub ops: Vec<Op>,
 }
 
-/// Live rows at one log position, ascending id, raw (stored) vectors.
+/// Live rows at one log position, ascending id, raw (stored) vectors, plus
+/// the current model and its baseline for the swap gate.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub seq: u64,
     pub epoch: u64,
+    /// The current model with no rows (`live::empty_like`).
+    pub model: IvfPqIndex,
+    pub baseline: DriftBaseline,
     /// `max_ts` of the index; the rebuilt index keeps it so the same writes
     /// are refused before and after the swap.
     pub max_ts: u64,
@@ -127,7 +153,7 @@ pub struct Rebuilt {
 /// Epoch 0 on a freshly built index (needs `store_vecs`).
 pub fn start(idx: IvfPqIndex) -> Live {
     Live {
-        scratch: live::scratch_for(&idx), seq: 0, epoch: 0, base_seed: idx.params.seed,
+        scratch: live::scratch_for(&idx), seq: 0, model_seq: 0, epoch: 0, base_seed: idx.params.seed,
         baseline: drift::baseline(&idx), stats: drift::new_stats(&idx), carry: None, idx,
     }
 }
@@ -140,6 +166,16 @@ pub fn write(st: &mut Live, op: &Op) -> Result<Applied, WriteError> {
     if let Some(c) = &mut st.carry { carry_effect(&mut c.ops, op, &r); }
     st.seq += 1;
     r
+}
+
+/// Writes applied since the last swap or reject (since the start in epoch 0).
+pub fn ops_since_model(st: &Live) -> u64 { st.seq - st.model_seq }
+
+/// Whether to take a snapshot now: no rebuild pending, a signal fired, and
+/// at least `th.min_ops_per_epoch` writes since the last model decision.
+/// Pure function of the state, so it holds at the same op on every run.
+pub fn due(st: &Live, sig: &Signals, th: &Thresholds) -> bool {
+    st.carry.is_none() && sig.fired != 0 && ops_since_model(st) >= th.min_ops_per_epoch
 }
 
 /// Append what `op` did (`result`) as layout-independent ops.
@@ -173,7 +209,7 @@ pub fn snapshot(st: &mut Live) -> Result<Snapshot, RebuildError> {
     rows.sort_unstable_by_key(|r| r.0); // ids of live rows are unique
     let n = rows.len();
     let mut snap = Snapshot {
-        seq: st.seq, epoch: st.epoch, max_ts: idx.max_ts, metric: idx.metric, dim, params: idx.params,
+        seq: st.seq, epoch: st.epoch, model: live::empty_like(idx), baseline: st.baseline.clone(), max_ts: idx.max_ts, metric: idx.metric, dim, params: idx.params,
         ids: Vec::with_capacity(n), ts: Vec::with_capacity(n), tags: Vec::with_capacity(n), vecs: Vec::with_capacity(n * dim),
     };
     for (id, li, r) in rows {
@@ -210,7 +246,7 @@ pub fn rebuild(snap: &Snapshot, base_seed: u64, threads: usize) -> Result<Rebuil
     }
     idx.max_ts = snap.max_ts;
     let next = Live {
-        scratch: live::scratch_for(&idx), seq: snap.seq, epoch, base_seed,
+        scratch: live::scratch_for(&idx), seq: snap.seq, model_seq: snap.seq, epoch, base_seed,
         baseline: drift::baseline(&idx), stats: drift::new_stats(&idx), carry: None, idx,
     };
     Ok(Rebuilt { next, snapshot_seq: snap.seq, carried: 0 })
@@ -228,27 +264,47 @@ pub fn catch_up(r: &mut Rebuilt, carry: &Carry) -> Result<(), RebuildError> {
     Ok(())
 }
 
-/// Replace `st` with the caught-up rebuild and return the `SwapModel` entry
-/// to append to the log (it takes position `st.seq`).
-pub fn swap(st: &mut Live, r: Rebuilt) -> Result<LogOp, RebuildError> {
+/// Replace `st` with the caught-up rebuild that `gate` accepted and return
+/// the `SwapModel` entry to append to the log (it takes position `st.seq`).
+pub fn swap(st: &mut Live, r: Rebuilt, gate: Gate) -> Result<LogOp, RebuildError> {
+    if !gate.accept { return Err(RebuildError::GateDecision { accept: false }); }
     let carry = st.carry.as_ref().ok_or(RebuildError::NoRebuildPending)?;
     if carry.snapshot_seq != r.snapshot_seq { return Err(RebuildError::WrongSnapshot { got: r.snapshot_seq, want: carry.snapshot_seq }); }
     if r.carried != carry.ops.len() { return Err(RebuildError::NotCaughtUp { carried: r.carried, pending: carry.ops.len() }); }
     if r.next.epoch != st.epoch + 1 { return Err(RebuildError::WrongEpoch { got: r.next.epoch, want: st.epoch + 1 }); }
-    let entry = LogOp::SwapModel { epoch: r.next.epoch, snapshot_seq: r.snapshot_seq, model_hash: model_hash(&r.next.idx) };
+    let entry = LogOp::SwapModel { epoch: r.next.epoch, snapshot_seq: r.snapshot_seq, model_hash: model_hash(&r.next.idx), gate };
     let seq = st.seq + 1;
     *st = r.next;
     st.seq = seq;
+    st.model_seq = seq;
+    Ok(entry)
+}
+
+/// Drop a rebuild that `gate` rejected: end the carry, keep the old model,
+/// and return the `RejectModel` entry for the log (position `st.seq`). No
+/// catch-up needed. Drift stats carry on, and `due` waits another
+/// `min_ops_per_epoch` writes before the next try.
+pub fn reject(st: &mut Live, r: &Rebuilt, gate: Gate) -> Result<LogOp, RebuildError> {
+    let carry = st.carry.as_ref().ok_or(RebuildError::NoRebuildPending)?;
+    if carry.snapshot_seq != r.snapshot_seq { return Err(RebuildError::WrongSnapshot { got: r.snapshot_seq, want: carry.snapshot_seq }); }
+    if r.next.epoch != st.epoch + 1 { return Err(RebuildError::WrongEpoch { got: r.next.epoch, want: st.epoch + 1 }); }
+    if gate.accept { return Err(RebuildError::GateDecision { accept: true }); }
+    let entry = LogOp::RejectModel { epoch: r.next.epoch, snapshot_seq: r.snapshot_seq, model_hash: model_hash(&r.next.idx), gate };
+    st.carry = None;
+    st.seq += 1;
+    st.model_seq = st.seq;
     Ok(entry)
 }
 
 /// Replay `log` from the epoch-0 index `base`. Snapshots are taken at the
-/// positions the `SwapModel` entries name, and each swap rebuilds, catches
-/// up and checks the logged model hash. Same log, same state as the live run.
+/// positions the decision entries name; each one rebuilds, re-runs the gate
+/// with the logged parameters and game verdict, and checks the model hash
+/// and the whole gate against the log, then swaps (after catch-up) or
+/// rejects as logged. Same log, same state as the live run.
 pub fn replay(base: IvfPqIndex, log: &[LogOp], threads: usize) -> Result<Live, RebuildError> {
     let mut wanted: Vec<u64> = Vec::new();
     for (i, e) in log.iter().enumerate() {
-        if let LogOp::SwapModel { snapshot_seq, .. } = e {
+        if let LogOp::SwapModel { snapshot_seq, .. } | LogOp::RejectModel { snapshot_seq, .. } = e {
             if *snapshot_seq > i as u64 { return Err(RebuildError::BadSnapshotSeq { seq: i as u64, snapshot_seq: *snapshot_seq }); }
             wanted.push(*snapshot_seq);
         }
@@ -259,16 +315,23 @@ pub fn replay(base: IvfPqIndex, log: &[LogOp], threads: usize) -> Result<Live, R
         if wanted.contains(&st.seq) && !snaps.contains_key(&st.seq) { snaps.insert(st.seq, snapshot(&mut st)?); }
         match e {
             LogOp::Write(op) => { let _ = write(&mut st, op); }
-            LogOp::SwapModel { epoch, snapshot_seq, model_hash: logged } => {
+            LogOp::SwapModel { epoch, snapshot_seq, model_hash: logged, gate: lg }
+            | LogOp::RejectModel { epoch, snapshot_seq, model_hash: logged, gate: lg } => {
                 let seq = i as u64;
                 let snap = snaps.remove(snapshot_seq).ok_or(RebuildError::BadSnapshotSeq { seq, snapshot_seq: *snapshot_seq })?;
                 let mut r = rebuild(&snap, st.base_seed, threads)?;
-                drop(snap);
-                catch_up(&mut r, st.carry.as_ref().ok_or(RebuildError::NoRebuildPending)?)?;
                 if r.next.epoch != *epoch { return Err(RebuildError::WrongEpoch { got: *epoch, want: r.next.epoch }); }
                 let h = model_hash(&r.next.idx);
                 if h != *logged { return Err(RebuildError::HashMismatch { seq, logged: *logged, rebuilt: h }); }
-                swap(&mut st, r)?;
+                let g = gate::evaluate(&snap, &r, &lg.params, lg.game, threads)?;
+                drop(snap);
+                if g != *lg { return Err(RebuildError::GateMismatch { seq }); }
+                if matches!(e, LogOp::SwapModel { .. }) {
+                    catch_up(&mut r, st.carry.as_ref().ok_or(RebuildError::NoRebuildPending)?)?;
+                    swap(&mut st, r, g)?;
+                } else {
+                    reject(&mut st, &r, g)?;
+                }
             }
         }
     }

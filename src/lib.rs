@@ -12,6 +12,7 @@
 //! - `live`: deterministic insert / delete / upsert / expire / compact for IVF-PQ.
 //! - `drift`: per-list drift stats and rebuild signals for a live IVF-PQ index.
 //! - `rebuild`: snapshot, next-epoch rebuild, catch-up and logged model swap.
+//! - `gate`: deterministic offline check that a rebuilt model beats the current one.
 
 pub mod metric;
 pub mod types;
@@ -35,6 +36,7 @@ pub mod pick;
 pub mod live;
 pub mod drift;
 pub mod rebuild;
+pub mod gate;
 pub use ivfpq::{IvfPqIndex, IvfPqParams, RowLoc};
 // src/lib.rs
 pub use context::{

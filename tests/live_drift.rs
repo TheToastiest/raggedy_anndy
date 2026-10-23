@@ -10,7 +10,12 @@
 //! - a rebuild from one snapshot is reproducible (model hash and fingerprint),
 //!   on a worker thread or inline, with any thread count;
 //! - replaying a log that contains `SwapModel` gives the live run's state;
-//! - recall lost to shifted content comes back after the rebuild.
+//! - recall lost to shifted content comes back after the rebuild;
+//! - a rebuild may not start until `min_ops_per_epoch` writes after the last
+//!   model decision, so a continuing shift no longer re-triggers every ~320 ops;
+//! - the swap gate (worker side) accepts a model trained on shifted data,
+//!   rejects one no better than the current model, and replay of a log with
+//!   both decisions reproduces the live run.
 
 mod common;
 use common::*;
@@ -18,6 +23,7 @@ use common::*;
 use std::collections::BTreeMap;
 
 use raggedy_anndy::drift::{self, Signals, Thresholds};
+use raggedy_anndy::gate::{self, GameCheck, Gate, GateParams, GateReason};
 use raggedy_anndy::live::{self, Op};
 use raggedy_anndy::rebuild::{self, Live, LogOp};
 use raggedy_anndy::seed::SplitMix64;
@@ -71,6 +77,20 @@ fn shifted_mix(n: usize, seed: u64) -> Vec<Op> {
     ops
 }
 
+/// A shift that keeps arriving: `shifted_mix(4000)`, then the oldest half of
+/// the training rows expire, then 4000 more shifted inserts; 9001 ops. With
+/// the default cadence the first rebuild (op 4096, ~16% of the rows shifted)
+/// loses the gate and the second (op ~8200, ~40%) wins.
+fn continuing_shift(seed: u64) -> Vec<Op> {
+    let mut ops = shifted_mix(4_000, seed);
+    ops.push(Op::Expire { before_ts: (N / 2) as u64, max_rows: usize::MAX });
+    ops.extend(shifted_mix(4_000, seed + 1).into_iter().filter_map(|op| match op {
+        Op::Insert { id, ts, tags, vec } => Some(Op::Insert { id: id + 500_000, ts: ts + 100_000, tags, vec }),
+        _ => None,
+    }));
+    ops
+}
+
 fn assert_ok(idx: &IvfPqIndex) {
     if let Err(e) = live::check_invariants(idx) { panic!("invariant broken: {e}"); }
 }
@@ -100,24 +120,52 @@ enum SwapWhen {
     AfterOps(u64),
 }
 
-/// Rebuilds per test run. The design has no cooldown yet, and while a shift
-/// is still arriving each new model is trained on only part of it, so the
-/// signals fire again soon after every swap.
-const MAX_REBUILDS: u64 = 2;
+type Worker = std::thread::JoinHandle<(rebuild::Rebuilt, Gate, std::thread::ThreadId)>;
 
-/// The writer loop: log, apply, check, snapshot on a signal, rebuild on a
-/// worker thread, catch up and swap. Returns the final state and the log.
-fn live_run(base: &IvfPqIndex, ops: &[Op], th: &Thresholds, when: SwapWhen) -> (Live, Vec<LogOp>) {
+/// Rebuild and gate on a worker thread; returns the worker's thread id too.
+fn spawn_worker(snap: rebuild::Snapshot, base_seed: u64, gp: GateParams) -> Worker {
+    std::thread::spawn(move || {
+        let r = rebuild::rebuild(&snap, base_seed, 2).unwrap();
+        let g = gate::evaluate(&snap, &r, &gp, GameCheck::NotRun, 2).unwrap();
+        (r, g, std::thread::current().id())
+    })
+}
+
+/// Writer side of a finished worker: swap (after catch-up) if the gate
+/// accepted, else reject. Returns the log entry.
+fn decide(st: &mut Live, h: Worker) -> LogOp {
+    let (mut r, g, worker) = h.join().unwrap();
+    assert_ne!(worker, std::thread::current().id(), "gate ran on the writer thread");
+    if g.accept {
+        rebuild::catch_up(&mut r, st.carry.as_ref().unwrap()).unwrap();
+        rebuild::swap(st, r, g).unwrap()
+    } else {
+        rebuild::reject(st, &r, g).unwrap()
+    }
+}
+
+fn decisions(log: &[LogOp]) -> Vec<&LogOp> {
+    log.iter().filter(|e| matches!(e, LogOp::SwapModel { .. } | LogOp::RejectModel { .. })).collect()
+}
+
+/// Positions of the snapshots behind each decision, and of the decisions.
+fn decision_seqs(log: &[LogOp]) -> Vec<(u64, u64)> {
+    log.iter().enumerate().filter_map(|(i, e)| match e {
+        LogOp::SwapModel { snapshot_seq, .. } | LogOp::RejectModel { snapshot_seq, .. } => Some((*snapshot_seq, i as u64)),
+        _ => None,
+    }).collect()
+}
+
+/// The writer loop: log, apply, check, snapshot when `rebuild::due`, rebuild
+/// and gate on a worker thread, then swap or reject. At most `max_decisions`
+/// rebuilds (each costs ~1 s here). Returns the final state and the log.
+fn live_run(base: &IvfPqIndex, ops: &[Op], th: &Thresholds, gp: &GateParams, when: SwapWhen, max_decisions: usize) -> (Live, Vec<LogOp>) {
     let base_seed = base.params.seed;
     let mut st = rebuild::start(base.clone());
     let mut log: Vec<LogOp> = Vec::new();
-    let mut pending: Option<(u64, std::thread::JoinHandle<rebuild::Rebuilt>)> = None;
-    let finish = |st: &mut Live, log: &mut Vec<LogOp>, h: std::thread::JoinHandle<rebuild::Rebuilt>| {
-        let mut r = h.join().unwrap();
-        rebuild::catch_up(&mut r, st.carry.as_ref().unwrap()).unwrap();
-        let entry = rebuild::swap(st, r).unwrap();
-        log.push(entry);
-    };
+    let mut pending: Option<(u64, Worker)> = None;
+    let mut started = 0usize;
+    let finish = |st: &mut Live, log: &mut Vec<LogOp>, h: Worker| { let e = decide(st, h); log.push(e); };
     for op in ops {
         log.push(LogOp::Write(op.clone()));
         let _ = rebuild::write(&mut st, op);
@@ -128,10 +176,10 @@ fn live_run(base: &IvfPqIndex, ops: &[Op], th: &Thresholds, when: SwapWhen) -> (
                 SwapWhen::AfterOps(lag) => st.seq >= snap_seq + lag,
             };
             if due { finish(&mut st, &mut log, h); } else { pending = Some((snap_seq, h)); }
-        } else if st.epoch < MAX_REBUILDS && drift::check(&st.stats, &st.baseline, &st.idx, th).fired != 0 {
+        } else if started < max_decisions && rebuild::due(&st, &drift::check(&st.stats, &st.baseline, &st.idx, th), th) {
             let snap = rebuild::snapshot(&mut st).unwrap();
-            let seq = snap.seq;
-            pending = Some((seq, std::thread::spawn(move || rebuild::rebuild(&snap, base_seed, 2).unwrap())));
+            started += 1;
+            pending = Some((snap.seq, spawn_worker(snap, base_seed, *gp)));
         }
     }
     if let Some((_, h)) = pending { finish(&mut st, &mut log, h); }
@@ -239,6 +287,18 @@ fn drifted_state() -> Live {
     st
 }
 
+/// Half the content shifted: the oldest half of the training rows expired
+/// and as many shifted rows arrived. A rebuild from here is clearly better.
+/// (At a quarter shifted, `drifted_state`, the rebuilt model is not: see
+/// `gate_rejects_a_model_trained_on_too_little_of_a_shift`.)
+fn half_shifted_state() -> Live {
+    let (base, _) = base_index();
+    let mut st = rebuild::start(base);
+    rebuild::write(&mut st, &Op::Expire { before_ts: (N / 2) as u64, max_rows: usize::MAX }).unwrap();
+    for op in &insert_ops(&shifted_data(N / 2, 52), 1_000_000, N as u64) { rebuild::write(&mut st, op).unwrap(); }
+    st
+}
+
 #[test]
 fn rebuild_from_one_snapshot_is_reproducible() {
     let mut st = drifted_state();
@@ -318,19 +378,25 @@ fn assert_same_state(a: &Live, b: &Live) {
     assert_eq!(a.idx.fingerprint(), b.idx.fingerprint());
     assert_eq!(a.stats, b.stats);
     assert_eq!(a.baseline, b.baseline);
+    assert_eq!(a.model_seq, b.model_seq);
 }
 
 #[test]
 fn replaying_a_log_with_swap_model_equals_the_live_run() {
+    // A reject then a swap (fixed lags), or whatever the worker's timing
+    // gives (`WorkerDone`): replay ends in the live run's state either way.
     let (base, _) = base_index();
-    let ops = shifted_mix(6_000, 40);
+    let ops = continuing_shift(40);
     let th = drift::default_thresholds();
+    let gp = gate::default_gate_params();
     for when in [SwapWhen::WorkerDone, SwapWhen::AfterOps(300), SwapWhen::AfterOps(0)] {
-        let (st, log) = live_run(&base, &ops, &th, when);
-        let swaps: Vec<&LogOp> = log.iter().filter(|e| matches!(e, LogOp::SwapModel { .. })).collect();
-        println!("swaps: {swaps:?}");
-        assert!(!swaps.is_empty(), "no rebuild happened");
-        assert!(st.epoch >= 1);
+        let (st, log) = live_run(&base, &ops, &th, &gp, when, 2);
+        let swaps = log.iter().filter(|e| matches!(e, LogOp::SwapModel { .. })).count();
+        println!("decisions (snapshot, at): {:?}, swaps {swaps}", decision_seqs(&log));
+        assert!(!decisions(&log).is_empty(), "no rebuild happened");
+        // With `WorkerDone` the writer may outrun the worker and decide only
+        // at the end (one reject); with a fixed lag both decisions land.
+        if let SwapWhen::AfterOps(_) = when { assert!(swaps >= 1 && st.epoch >= 1, "no swap"); }
         assert_ok(&st.idx);
 
         let replayed = rebuild::replay(base.clone(), &log, 4).unwrap();
@@ -348,29 +414,33 @@ fn replaying_a_log_with_swap_model_equals_the_live_run() {
 fn swap_model_with_a_wrong_hash_is_refused() {
     let (base, _) = base_index();
     let ops = shifted_mix(4_000, 42);
-    let (_, mut log) = live_run(&base, &ops, &drift::default_thresholds(), SwapWhen::AfterOps(10));
-    let at = log.iter().position(|e| matches!(e, LogOp::SwapModel { .. })).unwrap();
-    if let LogOp::SwapModel { model_hash, .. } = &mut log[at] { *model_hash ^= 1; }
-    assert!(rebuild::replay(base, &log, 1).is_err());
+    let (_, mut log) = live_run(&base, &ops, &drift::default_thresholds(), &gate::default_gate_params(), SwapWhen::AfterOps(10), 1);
+    let at = log.iter().position(|e| matches!(e, LogOp::SwapModel { .. } | LogOp::RejectModel { .. })).unwrap();
+    if let LogOp::SwapModel { model_hash, .. } | LogOp::RejectModel { model_hash, .. } = &mut log[at] { *model_hash ^= 1; }
+    assert!(matches!(rebuild::replay(base, &log, 1), Err(rebuild::RebuildError::HashMismatch { .. })));
 }
 
 #[test]
 fn swap_is_refused_until_caught_up() {
-    let mut st = drifted_state();
+    let mut st = half_shifted_state();
     let snap = rebuild::snapshot(&mut st).unwrap();
     let r = rebuild::rebuild(&snap, st.base_seed, 2).unwrap();
+    let g = gate::evaluate(&snap, &r, &gate::default_gate_params(), GameCheck::NotRun, 2).unwrap();
+    assert!(g.accept, "{g:?}");
     let ds = shifted_data(1, 43);
     let ts = st.idx.max_ts;
     rebuild::write(&mut st, &Op::Insert { id: 9_000_000, ts, tags: 0, vec: row(&ds, 0).to_vec() }).unwrap();
     let fp = st.idx.fingerprint();
     assert!(matches!(rebuild::snapshot(&mut st), Err(rebuild::RebuildError::RebuildPending { .. })));
-    assert!(matches!(rebuild::swap(&mut st, r.clone()), Err(rebuild::RebuildError::NotCaughtUp { carried: 0, pending: 1 })));
+    assert!(matches!(rebuild::swap(&mut st, r.clone(), g), Err(rebuild::RebuildError::NotCaughtUp { carried: 0, pending: 1 })));
     assert_eq!(st.idx.fingerprint(), fp);
     assert_eq!(st.epoch, 0);
     let mut r = r;
     rebuild::catch_up(&mut r, st.carry.as_ref().unwrap()).unwrap();
     let seq = st.seq;
-    assert!(matches!(rebuild::swap(&mut st, r), Ok(LogOp::SwapModel { epoch: 1, .. })));
+    assert!(matches!(gate::evaluate(&snap, &r, &gate::default_gate_params(), GameCheck::NotRun, 2), Err(rebuild::RebuildError::GateAfterCatchUp { carried: 1 })));
+    assert!(matches!(rebuild::swap(&mut st, r, g), Ok(LogOp::SwapModel { epoch: 1, .. })));
+    assert_eq!(st.model_seq, st.seq);
     assert_eq!((st.epoch, st.seq), (1, seq + 1));
     assert!(st.carry.is_none());
     assert_eq!(live::locate(&st.idx, 9_000_000).map(|_| ()), Some(()));
@@ -420,7 +490,10 @@ fn recall_drops_with_shifted_content_and_comes_back_after_rebuild() {
     let snap = rebuild::snapshot(&mut st).unwrap();
     let r = rebuild::rebuild(&snap, st.base_seed, 4).unwrap();
     let took = t.elapsed();
-    rebuild::swap(&mut st, r).unwrap();
+    let g = gate::evaluate(&snap, &r, &gate::default_gate_params(), GameCheck::NotRun, 2).unwrap();
+    println!("gate: current recall {:.4}, candidate {:.4}, {:?}", gate::recall(g.current_hits, g.trials), gate::recall(g.candidate_hits, g.trials), g.reason);
+    assert!(g.accept, "{g:?}");
+    rebuild::swap(&mut st, r, g).unwrap();
     let r_after = recall_at_10(&st.idx, &rows, &qmix);
     let (r_after_a, r_after_b) = (recall_at_10(&st.idx, &rows, &qa), recall_at_10(&st.idx, &rows, &qb));
 
@@ -433,9 +506,157 @@ fn recall_drops_with_shifted_content_and_comes_back_after_rebuild() {
     assert_ok(&st.idx);
 }
 
+// ------------------------------------------------------------ cadence
+
+#[test]
+fn a_continuing_shift_waits_min_ops_between_rebuilds() {
+    let (base, _) = base_index();
+    let ops = shifted_mix(8_000, 60); // 10_000 ops of one long shift
+    let gp = gate::default_gate_params();
+
+    // Without the floor the shift re-triggers soon after every decision.
+    let mut eager = drift::default_thresholds();
+    eager.min_ops_per_epoch = 0;
+    let (_, log) = live_run(&base, &ops[..2_500], &eager, &gp, SwapWhen::AfterOps(10), 3);
+    let eager_at = decision_seqs(&log);
+    println!("min_ops_per_epoch 0: (snapshot, decision) {eager_at:?}");
+    assert!(eager_at.len() >= 2, "{eager_at:?}");
+    assert!(eager_at.windows(2).any(|w| w[1].0 - (w[0].1 + 1) < 1_000), "no quick re-trigger without the floor: {eager_at:?}");
+
+    // With the default floor: the first snapshot waits for op 4096 although
+    // the signal fired at op ~320, and every later one waits 4096 ops after
+    // the previous decision. Same positions on every run.
+    let th = drift::default_thresholds();
+    let (a_st, a) = live_run(&base, &ops, &th, &gp, SwapWhen::AfterOps(10), 4);
+    let (b_st, b) = live_run(&base, &ops, &th, &gp, SwapWhen::AfterOps(10), 4);
+    let at = decision_seqs(&a);
+    println!("min_ops_per_epoch {}: (snapshot, decision) {at:?}", th.min_ops_per_epoch);
+    assert_eq!(a, b);
+    assert_same_state(&a_st, &b_st);
+    assert_eq!(at.len(), 2, "{at:?}");
+    assert_eq!(at[0].0, th.min_ops_per_epoch);
+    assert_eq!(at[1].0, at[0].1 + 1 + th.min_ops_per_epoch);
+    assert!(first_fire(&base, &ops, &th).unwrap().0 < 1_000);
+}
+
+// ------------------------------------------------------------ gate
+
+fn print_gate(what: &str, g: &Gate) {
+    println!("{what}: recall@{} current {:.4}, candidate {:.4} ({} queries); drift qerr {:.2} -> {:.2}, rnorm {:.2} -> {:.2}, fired {:#x} -> {:#x}; accept {} ({:?})",
+        g.params.k, gate::recall(g.current_hits, g.trials), gate::recall(g.candidate_hits, g.trials), g.queries,
+        g.current.qerr_ratio, g.candidate.qerr_ratio, g.current.rnorm_ratio, g.candidate.rnorm_ratio,
+        g.current.fired, g.candidate.fired, g.accept, g.reason);
+}
+
+#[test]
+fn gate_accepts_a_model_trained_on_shifted_data() {
+    let mut st = half_shifted_state();
+    let snap = rebuild::snapshot(&mut st).unwrap();
+    let r = rebuild::rebuild(&snap, st.base_seed, 2).unwrap();
+    let gp = gate::default_gate_params();
+    let g = gate::evaluate(&snap, &r, &gp, GameCheck::NotRun, 2).unwrap();
+    print_gate("shifted", &g);
+    assert!(g.accept, "{g:?}");
+    assert_eq!(g.reason, GateReason::RecallGain);
+    assert!(g.current.fired & gate::MODEL_SIGNALS != 0 && g.candidate.fired == 0, "{g:?}");
+
+    // Same gate on a worker with 1 thread, and with 5 threads on a rebuild
+    // made with another thread count.
+    let w = { let (snap, r) = (snap.clone(), r.clone()); std::thread::spawn(move || gate::evaluate(&snap, &r, &gp, GameCheck::NotRun, 1).unwrap()).join().unwrap() };
+    let r5 = rebuild::rebuild(&snap, st.base_seed, 5).unwrap();
+    assert_eq!(w, g);
+    assert_eq!(gate::evaluate(&snap, &r5, &gp, GameCheck::NotRun, 5).unwrap(), g);
+
+    // The game-level hook can veto; its verdict is part of the gate.
+    let vetoed = gate::evaluate(&snap, &r, &gp, GameCheck::Fail, 2).unwrap();
+    assert!(!vetoed.accept && vetoed.reason == GateReason::GameCheckFailed);
+    assert_eq!((vetoed.current_hits, vetoed.candidate_hits), (g.current_hits, g.candidate_hits));
+}
+
+#[test]
+fn gate_rejects_a_model_trained_on_too_little_of_a_shift() {
+    // 6000 shifted rows among 18500 training rows: the rebuilt model still
+    // spends its lists and codebooks on the training half and does no better
+    // on the recent rows, though the current model's drift signals fire.
+    let mut st = drifted_state();
+    let snap = rebuild::snapshot(&mut st).unwrap();
+    let r = rebuild::rebuild(&snap, st.base_seed, 2).unwrap();
+    let g = gate::evaluate(&snap, &r, &gate::default_gate_params(), GameCheck::NotRun, 2).unwrap();
+    print_gate("quarter shifted", &g);
+    assert!(!g.accept && g.reason == GateReason::NoGain, "{g:?}");
+    assert!(g.current.fired != 0 && g.candidate.fired != 0, "{g:?}");
+}
+
+#[test]
+fn gate_rejects_a_model_no_better_and_the_old_model_stays() {
+    // More of the training distribution: the rebuild has nothing to fix.
+    let (base, _) = base_index();
+    let mut st = rebuild::start(base);
+    for op in &insert_ops(&train_data(3_000, 61), 1_000_000, N as u64) { rebuild::write(&mut st, op).unwrap(); }
+    let snap = rebuild::snapshot(&mut st).unwrap();
+    let r = rebuild::rebuild(&snap, st.base_seed, 2).unwrap();
+    let g = gate::evaluate(&snap, &r, &gate::default_gate_params(), GameCheck::NotRun, 2).unwrap();
+    print_gate("in-distribution", &g);
+    assert!(!g.accept, "{g:?}");
+    assert_eq!(g.reason, GateReason::NoGain);
+
+    // Writes keep landing on the old model while the worker runs.
+    rebuild::write(&mut st, &Op::Delete { id: 5 }).unwrap();
+    let (hash, fp, stats, seq) = (rebuild::model_hash(&st.idx), st.idx.fingerprint(), st.stats.clone(), st.seq);
+    assert!(matches!(rebuild::swap(&mut st, r.clone(), g), Err(rebuild::RebuildError::GateDecision { accept: false })));
+    let e = rebuild::reject(&mut st, &r, g).unwrap();
+    assert!(matches!(e, LogOp::RejectModel { epoch: 1, snapshot_seq, .. } if snapshot_seq == snap.seq));
+    assert_eq!((st.epoch, rebuild::model_hash(&st.idx), st.idx.fingerprint()), (0, hash, fp));
+    assert_eq!(st.stats, stats);
+    assert_eq!((st.seq, st.model_seq), (seq + 1, seq + 1));
+    assert!(st.carry.is_none());
+    assert_eq!(rebuild::ops_since_model(&st), 0);
+    assert!(rebuild::snapshot(&mut st).is_ok(), "a new rebuild can start after a reject");
+}
+
+#[test]
+fn decide_follows_the_rules() {
+    let gp = gate::default_gate_params();
+    use GateReason::*;
+    // 1000 trials: +0.02 is 20 hits.
+    assert_eq!(gate::decide(&gp, GameCheck::NotRun, 1000, 500, 520, 0, 0), (true, RecallGain));
+    assert_eq!(gate::decide(&gp, GameCheck::NotRun, 1000, 500, 519, 0, 0), (false, NoGain));
+    assert_eq!(gate::decide(&gp, GameCheck::Pass, 1000, 500, 500, drift::QERR, 0), (true, DriftCleared));
+    assert_eq!(gate::decide(&gp, GameCheck::NotRun, 1000, 500, 500, drift::QERR, drift::RNORM), (false, NoGain));
+    assert_eq!(gate::decide(&gp, GameCheck::NotRun, 1000, 500, 500, drift::CHURN, 0), (false, NoGain));
+    assert_eq!(gate::decide(&gp, GameCheck::Fail, 1000, 0, 1000, drift::QERR, 0), (false, GameCheckFailed));
+}
+
+#[test]
+fn replaying_a_log_with_accept_and_reject_equals_the_live_run() {
+    // A shift that keeps arriving: the first rebuild (op 4096, ~16% of the
+    // rows shifted) is rejected, the second, 4096 ops after the reject, is
+    // accepted.
+    let (base, _) = base_index();
+    let ops = continuing_shift(70);
+    let th = drift::default_thresholds();
+    let gp = gate::default_gate_params();
+    let (st, log) = live_run(&base, &ops, &th, &gp, SwapWhen::AfterOps(50), 2);
+    for e in decisions(&log) {
+        if let LogOp::SwapModel { gate: g, .. } | LogOp::RejectModel { gate: g, .. } = e { print_gate(if g.accept { "accepted" } else { "rejected" }, g); }
+    }
+    let kinds: Vec<bool> = decisions(&log).iter().map(|e| matches!(e, LogOp::SwapModel { .. })).collect();
+    assert_eq!(kinds, vec![false, true], "want one reject then one accept");
+    assert_eq!(st.epoch, 1);
+
+    let replayed = rebuild::replay(base.clone(), &log, 3).unwrap();
+    assert_same_state(&st, &replayed);
+
+    // A tampered gate in a reject entry is caught.
+    let mut bad = log.clone();
+    let at = bad.iter().position(|e| matches!(e, LogOp::RejectModel { .. })).unwrap();
+    if let LogOp::RejectModel { gate: g, .. } = &mut bad[at] { g.candidate_hits += 1; }
+    assert!(matches!(rebuild::replay(base, &bad, 1), Err(rebuild::RebuildError::GateMismatch { .. })));
+}
+
 // ------------------------------------------------------------ timing
 
-/// Snapshot + rebuild time for a 100k-row index. Not a gate.
+/// Snapshot + rebuild + swap gate time for a 100k-row index. Not a test gate.
 /// cargo test --release --test live_drift rebuild_time -- --ignored --nocapture
 #[test]
 #[ignore = "timing aid"]
@@ -451,6 +672,9 @@ fn rebuild_time() {
         let t_snap = t.elapsed();
         let t = std::time::Instant::now();
         let r = rebuild::rebuild(&snap, st.base_seed, threads).unwrap();
-        println!("n={n} dim={dim} nlist={nlist} m={m}: snapshot {t_snap:?}, rebuild threads={threads} {:?} (hash {:x})", t.elapsed(), rebuild::model_hash(&r.next.idx));
+        let t_build = t.elapsed();
+        let t = std::time::Instant::now();
+        let g = gate::evaluate(&snap, &r, &gate::default_gate_params(), GameCheck::NotRun, threads).unwrap();
+        println!("n={n} dim={dim} nlist={nlist} m={m}: snapshot {t_snap:?}, rebuild threads={threads} {t_build:?}, gate {:?} (hash {:x}, accept {})", t.elapsed(), rebuild::model_hash(&r.next.idx), g.accept);
     }
 }
