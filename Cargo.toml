@@ -61,5 +61,6 @@ thiserror = "2.0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 crossbeam = "0.8.4"
+arc-swap = "=1.7.1" # views::Latest: lock-free load of the newest view on query threads
 [dev-dependencies]
 proptest = "1"

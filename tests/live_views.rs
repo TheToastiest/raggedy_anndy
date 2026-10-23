@@ -10,7 +10,12 @@
 //!   (`fingerprint`) and the same search bits per tick as `live::apply`
 //!   on an `IvfPqIndex` for the same op log;
 //! - with a writer thread and several query threads, every result equals
-//!   the single-threaded reference for the view's seq.
+//!   the single-threaded reference for the view's seq;
+//! - when every pooled view is held, publish defers (the current view
+//!   stays) and catches up once one is free;
+//! - the compaction policy picks the same lists for the same log, at most
+//!   `max_per_tick` per tick, frees the blocks of expired rows, and does
+//!   not change search results.
 //!
 //! Loom is not used: it needs its own `Arc`/`Mutex`/atomics threaded
 //! through the crate, and `--cfg loom` also switches tokio (a dependency)
@@ -20,7 +25,7 @@
 //!     cargo +nightly miri test --lib arena
 //!     MIRIFLAGS=-Zmiri-deterministic-floats cargo +nightly miri test --test live_views tiny_
 //! (Miri adds random error to `exp` unless told not to; decay uses `exp`.)
-//! Insert allocation after `views::reserve` is checked in tests/live_alloc.rs.
+//! Insert and publish allocation after `views::reserve` is checked in tests/live_alloc.rs.
 
 mod common;
 use common::*;
@@ -138,7 +143,7 @@ fn writer_matches_live_apply_tick_by_tick() {
             for op in tick {
                 assert_eq!(views::apply(&mut w, op), live::apply(&mut idx, &mut s, op), "seed {seed} tick {t} {op:?}");
             }
-            assert_eq!(views::publish(&mut w), t as u64 + 1);
+            assert_eq!(views::publish(&mut w).seq, t as u64 + 1);
             let v = views::current(&latest);
             assert_eq!(v.seq, t as u64 + 1);
             for q in &qs { assert_eq!(probe_view(&v, q), probe_index(&idx, q), "seed {seed} tick {t}"); }
@@ -308,6 +313,230 @@ fn retired_blocks_are_not_reused_while_an_old_view_lives() {
     assert_view_ok(&views::current(&latest));
 }
 
+// ------------------------------------------------------------ view pool
+
+#[test]
+fn default_block_size_is_256_rows() {
+    assert_eq!(views::DEFAULT_BLOCK_ROWS, 256);
+    let w = views::writer_from(&base_index(600, 50), views::DEFAULT_BLOCK_ROWS);
+    assert_eq!(views::current(&views::latest(&w)).block_rows, 256);
+}
+
+/// Pool of 3 views. A query keeps every view it sees for a while, so the
+/// pool runs out and `publish` defers: the current view stays, held views
+/// keep their bits, and the writer keeps the same results as `live::apply`.
+/// Once the query lets go, the next publish shows the newest tick.
+#[test]
+fn publish_defers_while_every_view_is_held() {
+    let mut idx = base_index(2000, 40);
+    let mut w = views::writer_from(&idx, views::DEFAULT_BLOCK_ROWS);
+    views::reserve(&mut w, 64, 3);
+    let latest = views::latest(&w);
+    let ops = random_log(1200, 41, 1_000_000, 100_000, DIM, NLIST);
+    let mut s = live::scratch_for(&idx);
+    let mut rng = SplitMix64::new(42);
+    let qs: Vec<Vec<f32>> = (0..6).map(|_| random_unit(&mut rng, DIM)).collect();
+
+    let hold = |v: Arc<View>| { let fp = views::fingerprint(&v); let p: Vec<_> = qs.iter().map(|q| probe_view(&v, q)).collect(); (v, fp, p) };
+    let mut held = vec![hold(views::current(&latest))];
+    let mut deferred = 0u64;
+    let tick_ops = ticks(&ops, 20, 43);
+    for (t, tick) in tick_ops.iter().enumerate() {
+        for op in *tick { assert_eq!(views::apply(&mut w, op), live::apply(&mut idx, &mut s, op), "tick {t} {op:?}"); }
+        let p = views::publish(&mut w);
+        assert_eq!(p.seq, t as u64 + 1);
+        assert_eq!(p.deferred, p.seq - p.current);
+        let v = views::current(&latest);
+        assert_eq!(v.seq, p.current);
+        if p.deferred == 0 {
+            for q in &qs { assert_eq!(probe_view(&v, q), probe_index(&idx, q), "tick {t}"); }
+        } else {
+            deferred += 1;
+        }
+        // Hold every view of ticks 0..8 (more than the pool), release at 12 and 30.
+        if t < 8 || (20..26).contains(&t) { held.push(hold(v)); }
+        if t == 12 || t == 30 { held.clear(); }
+        for (h, fp, want) in &held {
+            for (i, q) in qs.iter().enumerate() { assert_eq!(&probe_view(h, q), &want[i], "tick {t}: held view {} changed", h.seq); }
+            assert_eq!(views::fingerprint(h), *fp);
+        }
+    }
+    assert!(deferred >= 4, "pool never ran out ({deferred} deferred)");
+    assert_eq!(views::arena_stats(&w).deferred, deferred);
+    assert_eq!(views::arena_stats(&w).grown, 0);
+    let v = views::current(&latest);
+    assert_eq!(v.seq, tick_ops.len() as u64);
+    assert_eq!(views::fingerprint(&v), idx.fingerprint());
+}
+
+// ------------------------------------------------------------ compaction policy
+
+/// The writer's tick as a server runs it: the tick's ops, then the
+/// policy's compactions (logged with them), then publish.
+fn tick_with_policy(w: &mut Writer, p: &views::CompactPolicy, tick: &[Op], log: &mut Vec<Op>, buf: &mut Vec<Op>) -> Vec<Applied> {
+    let mut out: Vec<Applied> = tick.iter().map(|op| { log.push(op.clone()); views::apply(w, op) }).filter_map(Result::ok).collect();
+    views::compactions_due(p, w, buf);
+    for op in buf.iter() { log.push(op.clone()); out.push(views::apply(w, op).unwrap()); }
+    views::publish(w);
+    out
+}
+
+/// Independent statement of the rule: due lists sorted by (dead_since, list).
+fn due_lists(p: &views::CompactPolicy, w: &Writer) -> Vec<u32> {
+    let mut due: Vec<(u64, u32)> = w.lists.iter().enumerate()
+        .filter(|(li, l)| l.dead > 0 && (w.seq - w.dead_since[*li] >= p.window_ticks || l.dead >= p.max_dead_rows || l.dead as f32 > p.max_dead_share * l.len as f32))
+        .map(|(li, _)| (w.dead_since[li], li as u32)).collect();
+    due.sort();
+    due.into_iter().map(|(_, li)| li).collect()
+}
+
+/// Same log, same choice on every run; each tick's choice is the first
+/// `max_per_tick` due lists by (oldest dead row, list index); the logged
+/// compactions replay through `live::apply` to the same bytes; and search
+/// results equal an index that never compacts.
+#[test]
+fn compaction_policy_is_deterministic_and_does_not_change_results() {
+    let p = views::CompactPolicy { window_ticks: 30, max_dead_share: 0.2, max_dead_rows: 40, max_per_tick: 2 };
+    let base = base_index(2000, 60);
+    // No Compact ops of its own, and uncapped expiry: a capped Expire counts
+    // the dead rows it walks, so after a compaction it would reach further,
+    // and the never-compacted index below would no longer be comparable.
+    let ops: Vec<Op> = random_log(5000, 61, 1_000_000, 100_000, DIM, NLIST).into_iter()
+        .filter(|op| !matches!(op, Op::Compact { .. }))
+        .map(|op| match op { Op::Expire { before_ts, .. } => Op::Expire { before_ts, max_rows: usize::MAX }, op => op })
+        .collect();
+    let tick_ops = ticks(&ops, 30, 62);
+    let mut rng = SplitMix64::new(63);
+    let qs: Vec<Vec<f32>> = (0..8).map(|_| random_unit(&mut rng, DIM)).collect();
+
+    let run = || {
+        let mut w = views::writer_from(&base, 16);
+        let (mut log, mut buf, mut chosen) = (Vec::new(), Vec::with_capacity(p.max_per_tick), Vec::new());
+        let mut plain = base.clone(); // never compacted
+        let mut s = live::scratch_for(&plain);
+        for (t, tick) in tick_ops.iter().enumerate() {
+            for op in *tick { let _ = live::apply(&mut plain, &mut s, op); }
+            for op in *tick { log.push(op.clone()); let _ = views::apply(&mut w, op); }
+            let mut want = due_lists(&p, &w);
+            want.truncate(p.max_per_tick);
+            views::compactions_due(&p, &w, &mut buf);
+            let got: Vec<u32> = buf.iter().map(|op| match op { Op::Compact { list } => *list, _ => unreachable!() }).collect();
+            assert_eq!(got, want, "tick {t}");
+            for op in buf.iter() { log.push(op.clone()); views::apply(&mut w, op).unwrap(); }
+            views::publish(&mut w);
+            chosen.push(got);
+            let v = views::current(&views::latest(&w));
+            for q in &qs { assert_eq!(probe_view(&v, q), probe_index(&plain, q), "tick {t}"); }
+        }
+        (chosen, log, views::fingerprint(&views::current(&views::latest(&w))))
+    };
+    let (a, log, fp) = run();
+    let (b, _, fp2) = run();
+    assert_eq!(a, b);
+    assert_eq!(fp, fp2);
+    assert!(a.iter().map(Vec::len).sum::<usize>() >= 20, "policy barely ran: {a:?}");
+
+    // The log (with the policy's compactions in it) replays to the same bytes.
+    let mut idx = base.clone();
+    let mut s = live::scratch_for(&idx);
+    for op in &log { let _ = live::apply(&mut idx, &mut s, op); }
+    assert_eq!(idx.fingerprint(), fp);
+}
+
+/// Every list over budget at once: the policy takes `max_per_tick` per
+/// tick in list order (all died in the same tick), until none is due.
+/// A lone dead row is only collected once the window has passed.
+#[test]
+fn compaction_policy_caps_per_tick_and_waits_for_the_window() {
+    let p = views::CompactPolicy { window_ticks: 50, max_dead_share: 0.25, max_dead_rows: usize::MAX, max_per_tick: 3 };
+    let idx = base_index(2000, 70);
+    let mut w = views::writer_from(&idx, 16);
+    let (mut log, mut buf) = (Vec::new(), Vec::new());
+    // Tick 1: kill half of every list.
+    let kill: Vec<Op> = w.lists.iter().flat_map(|l| (0..l.len).step_by(2).map(|r| l.blocks[r / 16].id(r % 16)).collect::<Vec<_>>())
+        .map(|id| Op::Delete { id }).collect();
+    let mut order = Vec::new();
+    let mut t = 0;
+    let mut first = true;
+    loop {
+        let tick: &[Op] = if first { &kill } else { &[] };
+        first = false;
+        let done = tick_with_policy(&mut w, &p, tick, &mut log, &mut buf);
+        let lists: Vec<u32> = done.iter().filter_map(|a| match a { Applied::Compacted { list, .. } => Some(*list), _ => None }).collect();
+        if lists.is_empty() { break; }
+        assert_eq!(lists.len(), 3.min(NLIST - order.len()), "tick {t}");
+        order.extend(lists);
+        t += 1;
+    }
+    assert_eq!(order, (0..NLIST as u32).collect::<Vec<_>>());
+    assert_eq!(t, (NLIST + 2) / 3);
+    assert!(w.lists.iter().all(|l| l.dead == 0));
+
+    // One dead row in list 5: under every budget, so due only after 50 ticks.
+    let l5 = &w.lists[5];
+    let id = l5.blocks[0].id(0);
+    let died = w.seq;
+    tick_with_policy(&mut w, &p, &[Op::Delete { id }], &mut log, &mut buf);
+    let mut waited = 0;
+    while buf.is_empty() {
+        tick_with_policy(&mut w, &p, &[], &mut log, &mut buf);
+        waited += 1;
+        assert!(waited <= 60, "lone dead row never collected");
+    }
+    assert_eq!(buf, vec![Op::Compact { list: 5 }]);
+    assert_eq!(w.seq - 1 - died, p.window_ticks);
+}
+
+/// Expiry only advances `head`; the policy's compactions are what free the
+/// blocks. After expiring most rows and letting the policy run, the lists
+/// hold far fewer blocks, and once no view sees the old ones they are
+/// reused by new inserts instead of new allocations.
+#[test]
+fn expired_rows_are_freed_by_policy_compaction() {
+    let p = views::CompactPolicy { window_ticks: 10, max_dead_share: 0.25, max_dead_rows: 64, max_per_tick: 4 };
+    let idx = base_index(4000, 80); // timestamps 0..4000
+    let mut w = views::writer_from(&idx, 16);
+    let latest = views::latest(&w);
+    let blocks = |w: &Writer| w.lists.iter().map(|l| l.blocks.len()).sum::<usize>();
+    let before = blocks(&w);
+    let (mut log, mut buf) = (Vec::new(), Vec::with_capacity(p.max_per_tick));
+    let mut rng = SplitMix64::new(81);
+    let qs: Vec<Vec<f32>> = (0..8).map(|_| random_unit(&mut rng, DIM)).collect();
+
+    // Expire 90% of rows, 500 rows walked per tick, policy every tick.
+    let mut t = 0;
+    loop {
+        let applied = tick_with_policy(&mut w, &p, &[Op::Expire { before_ts: 3600, max_rows: 500 }], &mut log, &mut buf);
+        let expired_all = applied.iter().any(|a| matches!(a, Applied::Expired { done: true, .. }));
+        t += 1;
+        if expired_all && w.lists.iter().all(|l| l.dead == 0) { break; }
+        assert!(t < 200);
+    }
+    assert_eq!(views::live_rows(&w), 400);
+    let after = blocks(&w);
+    assert!(after * 4 < before, "blocks {before} -> {after}");
+    assert!(w.lists.iter().all(|l| l.dead == 0 && l.head == 0));
+
+    // Search on the compacted view equals the log replayed on an index.
+    let mut ref_idx = idx.clone();
+    let mut s = live::scratch_for(&ref_idx);
+    for op in &log { let _ = live::apply(&mut ref_idx, &mut s, op); }
+    let v = views::current(&latest);
+    assert_eq!(views::fingerprint(&v), ref_idx.fingerprint());
+    for q in &qs { assert_eq!(probe_view(&v, q), probe_index(&ref_idx, q)); }
+    drop(v);
+
+    // A pool's worth of publishes later no view sees the old blocks: all reclaimed.
+    for _ in 0..views::DEFAULT_VIEWS { tick_with_policy(&mut w, &p, &[], &mut log, &mut buf); }
+    let st = views::arena_stats(&w);
+    assert_eq!(st.retired, 0, "{st:?}");
+    assert!(st.ready >= before - after - 1, "{st:?}");
+    // New rows go into reclaimed blocks.
+    for j in 0..1000u64 { views::insert(&mut w, 5_000_000 + j, 5_000, 0, &random_unit(&mut rng, DIM)).unwrap(); }
+    views::publish(&mut w);
+    assert_eq!(views::arena_stats(&w).allocated, st.allocated, "allocated new blocks while reclaimed ones were ready");
+}
+
 // ------------------------------------------------------------ stress
 
 /// Reference: results per (view seq, query), from `live::apply` on an
@@ -326,8 +555,11 @@ fn reference(base: &IvfPqIndex, tick_ops: &[&[Op]], qs: &[Vec<f32>]) -> Vec<Vec<
 /// Writer thread plus `readers` query threads. Each reader takes the
 /// newest view, runs seeded queries on it, sometimes keeps it and queries
 /// it again ticks later. Every result must equal the reference for that
-/// view's seq. Returns how many results were checked.
-fn stress(base: &IvfPqIndex, ops: &[Op], max_tick: usize, block_rows: usize, readers: usize, seed: u64, dim: usize) -> usize {
+/// view's seq. The pool has `pool` views, fewer than the readers can hold,
+/// so some publishes are deferred; after the log the writer publishes
+/// empty ticks until one goes through (their seqs show the last tick's
+/// state). Returns how many results were checked.
+fn stress(base: &IvfPqIndex, ops: &[Op], max_tick: usize, block_rows: usize, readers: usize, pool: usize, seed: u64, dim: usize) -> usize {
     let tick_ops = ticks(ops, max_tick, seed);
     let mut rng = SplitMix64::new(seed ^ 0xabc);
     let qs: Vec<Vec<f32>> = (0..6).map(|_| random_unit(&mut rng, dim)).collect();
@@ -335,8 +567,10 @@ fn stress(base: &IvfPqIndex, ops: &[Op], max_tick: usize, block_rows: usize, rea
     let last = tick_ops.len() as u64;
 
     let mut w = views::writer_from(base, block_rows);
+    views::reserve(&mut w, 0, pool);
     let latest = views::latest(&w);
     let checked = AtomicUsize::new(0);
+    let state = |seq: u64| seq.min(last) as usize;
     std::thread::scope(|sc| {
         let tick_ops = &tick_ops;
         sc.spawn(move || {
@@ -345,25 +579,26 @@ fn stress(base: &IvfPqIndex, ops: &[Op], max_tick: usize, block_rows: usize, rea
                 views::publish(&mut w);
                 std::thread::yield_now();
             }
+            while views::publish(&mut w).deferred > 0 { std::thread::yield_now(); }
         });
         for r in 0..readers {
-            let (latest, qs, want, checked) = (&latest, &qs, &want, &checked);
+            let (latest, qs, want, checked, state) = (&latest, &qs, &want, &checked, &state);
             sc.spawn(move || {
                 let mut rng = SplitMix64::new(seed + 1 + r as u64);
                 let mut kept: Vec<Arc<View>> = Vec::new();
                 loop {
                     let v = views::current(latest);
                     let qi = rng.gen_range(qs.len());
-                    assert_eq!(probe_view(&v, &qs[qi]), want[v.seq as usize][qi], "reader {r} seq {} query {qi}", v.seq);
+                    assert_eq!(probe_view(&v, &qs[qi]), want[state(v.seq)][qi], "reader {r} seq {} query {qi}", v.seq);
                     checked.fetch_add(1, Ordering::Relaxed);
                     if rng.gen_range(4) == 0 { kept.push(v.clone()); }
                     if kept.len() > 3 {
                         let old = kept.remove(rng.gen_range(kept.len()));
                         let qi = rng.gen_range(qs.len());
-                        assert_eq!(probe_view(&old, &qs[qi]), want[old.seq as usize][qi], "reader {r} kept seq {} query {qi}", old.seq);
+                        assert_eq!(probe_view(&old, &qs[qi]), want[state(old.seq)][qi], "reader {r} kept seq {} query {qi}", old.seq);
                         checked.fetch_add(1, Ordering::Relaxed);
                     }
-                    if v.seq == last { break; }
+                    if v.seq >= last { break; }
                 }
             });
         }
@@ -376,7 +611,7 @@ fn writer_and_query_threads_agree_with_reference_per_view() {
     let base = base_index(2000, 20);
     for (seed, block_rows) in [(21u64, 8usize), (22, 64)] {
         let ops = random_log(3000, seed, 1_000_000, 100_000, DIM, NLIST);
-        let n = stress(&base, &ops, 20, block_rows, 4, seed, DIM);
+        let n = stress(&base, &ops, 20, block_rows, 4, 6, seed, DIM);
         assert!(n > 100, "only {n} results checked");
     }
 }
@@ -394,7 +629,7 @@ fn tiny_writer_and_readers_under_miri() {
     p.iters = 2;
     let base = IvfPqIndex::build(Metric::Cosine, dim, &rows, p);
     let ops = random_log(if cfg!(miri) { 40 } else { 400 }, 31, 1_000_000, 1_000, dim, nlist);
-    assert!(stress(&base, &ops, 4, 2, 2, 31, dim) > 0);
+    assert!(stress(&base, &ops, 4, 2, 2, 3, 31, dim) > 0);
 }
 
 // ------------------------------------------------------------ timing
@@ -418,7 +653,7 @@ fn concurrent_query_latency() {
     let mut p = ivfpq_params(512, 16, 200, 32, 7);
     p.iters = 10;
     let idx = IvfPqIndex::build(Metric::Cosine, D, &ivfpq_rows(&data), p);
-    let block_rows: usize = std::env::var("RA_BLOCK_ROWS").ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+    let block_rows: usize = std::env::var("RA_BLOCK_ROWS").ok().and_then(|s| s.parse().ok()).unwrap_or(views::DEFAULT_BLOCK_ROWS);
 
     // `passes` runs over the 2000 timing queries.
     let measure = |s: &dyn Fn(&[f32]) -> Vec<Hit>, passes: usize| {
@@ -436,7 +671,7 @@ fn concurrent_query_latency() {
     eprintln!("IvfPqIndex::search            k=10 p50={a50:.0}us p95={a95:.0}us");
 
     let mut w = views::writer_from(&idx, block_rows);
-    views::reserve(&mut w, 64);
+    views::reserve(&mut w, 64, views::DEFAULT_VIEWS);
     let latest = views::latest(&w);
     let v = views::current(&latest);
     let (b50, b95) = measure(&|q| views::search(&v, q, 10), 1);

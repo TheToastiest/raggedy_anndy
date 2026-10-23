@@ -1,16 +1,16 @@
 //! Live writes, stage 2: one writer thread, any number of query threads.
 //!
 //! The writer applies the ops of tick T while queries read the view
-//! published at the end of tick T-1. Queries never wait on the writer's
-//! work: fetching the latest view is one `Arc` clone under a mutex that
-//! the writer holds only to swap in a pointer.
+//! published at the end of tick T-1. Queries never wait on the writer:
+//! fetching the latest view is one lock-free `ArcSwap::load_full` (an
+//! `Arc` clone), and the writer publishes with one `store`.
 //!
 //! Layout:
 //! - Row data (ids, timestamps, tags, PQ codes, raw vectors) lives in
-//!   fixed-capacity `arena::Block`s of `block_rows` rows. Row `r` of a list
-//!   is in `blocks[r / block_rows]`, slot `r % block_rows`. Blocks are
-//!   allocated whole and never move; growth adds a block. Written rows never
-//!   change.
+//!   fixed-capacity `arena::Block`s of `block_rows` rows (default
+//!   `DEFAULT_BLOCK_ROWS`). Row `r` of a list is in `blocks[r / block_rows]`,
+//!   slot `r % block_rows`. Blocks are allocated whole and never move;
+//!   growth adds a block. Written rows never change.
 //! - The small mutable metadata (per-list block table, row count, head,
 //!   dead count, tombstones) is `ListMeta`. The writer owns one set; each
 //!   published `View` owns a copy. Rows past a view's `len` are invisible
@@ -18,18 +18,34 @@
 //!   view of tick T.
 //! - The id directory is writer-only.
 //!
-//! Publish (`publish`): take a view no query holds (`Arc::get_mut`), copy
-//! into it the lists changed since that view's own tick, give it the new
-//! seq, and swap it into the shared slot. Only a view no one else holds is
+//! Publish (`publish`): the writer owns a fixed pool of views (`reserve`
+//! sizes it). It takes the newest view no query holds (`Arc::get_mut`),
+//! copies into it the lists changed since that view's own tick (into
+//! buffers `reserve` made big enough, so no allocation), gives it the new
+//! seq and stores it in the shared slot. Only a view no one else holds is
 //! ever written, so a held view never changes. No query holds it means no
-//! other thread can reach it: the writer keeps a handle to every view it
-//! has published, and the slot holds the newest one.
+//! other thread can reach it: the writer keeps a handle to every view in
+//! the pool, and the slot holds the newest one. If every view is held, the
+//! publish is deferred: nothing is allocated or written, the previous view
+//! stays current, and the next tick's publish shows both ticks.
+//!
+//! `ArcSwap` and `Arc::get_mut`: a `load` may hold the current view without
+//! raising its count (a "debt"), but `store` pays every debt on the old
+//! value before it returns, so a view that is not in the slot has an exact
+//! count. The view in the slot is never unique (the pool holds it too).
 //!
 //! Reclamation: compaction retires a list's old blocks. A retired block is
 //! reset and reused only when its `Arc` is unique, i.e. no view (held by a
-//! query or pooled by the writer) can still see it. The writer keeps one
-//! idle view as a spare and drops the rest at publish, so an idle view does
-//! not pin retired blocks for long.
+//! query or pooled by the writer) can still see it. A compaction marks
+//! every pooled view dirty; at the next publish where a dirty view is free
+//! (and not the one being written), it drops its handles to the blocks of
+//! every list changed since its seq, which it would copy again on reuse
+//! anyway. So an idle view does not pin retired blocks past one publish.
+//!
+//! Compaction policy (`compactions_due`): once per tick the writer asks
+//! which lists to compact and applies those `Op::Compact`s like any other
+//! op, so they are in the log and replay. This is also what frees the
+//! memory of expired rows.
 //!
 //! Results: search runs `ivfpq::search_rows`, the same scoring code as
 //! `IvfPqIndex::search_temporal`, over the view's blocks. A query's result
@@ -41,12 +57,24 @@
 //! Design: "IVF-PQ live insert and delete design" (project doc), stage 2.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 
 use crate::arena::Block;
 use crate::ivfpq::{search_rows, IvfPqIndex, ListRows, RowLoc, Run};
 use crate::live::{self, Applied, Op, Scratch, WriteError};
 use crate::types::Hit;
+
+/// Rows per block unless the caller picks another size.
+pub const DEFAULT_BLOCK_ROWS: usize = 256;
+
+/// Views in the pool after `writer_from`: the current one, one spare, and
+/// room for this many minus two query threads holding a view at once.
+pub const DEFAULT_VIEWS: usize = 8;
+
+/// `dead_since` of a list with no dead rows.
+pub const NEVER: u64 = u64::MAX;
 
 /// Per-list metadata. The writer owns one set; every view owns a copy.
 #[derive(Clone)]
@@ -72,7 +100,7 @@ pub struct View {
 }
 
 /// Where query threads get the newest view (`current`).
-pub type Latest = Arc<Mutex<Arc<View>>>;
+pub type Latest = Arc<ArcSwap<View>>;
 
 /// Block pool. Blocks in `ready` are empty and held by nothing else.
 struct Pool {
@@ -90,23 +118,118 @@ pub struct Writer {
     pub lists: Vec<ListMeta>,
     /// Seq of the tick that last changed each list.
     touched: Vec<u64>,
+    /// Per list, seq of the tick in which its oldest dead row died
+    /// (`NEVER` if it has none). Read by `compactions_due`.
+    pub dead_since: Vec<u64>,
     /// id -> location of its live row. Writer-only, never iterated.
     pub dir: HashMap<u64, RowLoc>,
     pub max_ts: u64,
     /// Seq of the tick being applied; `publish` gives it to the view.
     pub seq: u64,
     pool: Pool,
-    /// Every published view the writer may still recycle.
+    /// The view pool. Every view the writer may recycle, including the current one.
     views: Vec<Arc<View>>,
+    /// Per pooled view: a compaction ran since it was last written or
+    /// swept, so it may still hold retired blocks.
+    dirty: Vec<bool>,
     latest: Latest,
+    /// Seq of the view in `latest`.
+    current: u64,
+    /// Publishes deferred: in a row (since the last one that published), and in total.
+    pending: u64,
+    deferred: u64,
+    /// Publishes that had to grow a view's buffers (allocated).
+    grown: u64,
     scratch: Scratch,
 }
 
-/// Block counts, for tests and monitoring.
+/// What `publish` did at the end of a tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ArenaStats { pub allocated: usize, pub ready: usize, pub retired: usize, pub views: usize }
+pub struct Published {
+    /// The tick that ended.
+    pub seq: u64,
+    /// Seq of the view queries now get: `seq`, or an older one if deferred.
+    pub current: u64,
+    /// Ticks in a row not yet published, this one included; 0 if this
+    /// publish went through. Always `seq - current`.
+    pub deferred: u64,
+}
+
+/// Block and view counts, for tests and monitoring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArenaStats {
+    pub allocated: usize,
+    pub ready: usize,
+    pub retired: usize,
+    pub views: usize,
+    /// Publishes deferred because every view was held.
+    pub deferred: u64,
+    /// Publishes that grew a view's buffers (the writer outgrew `reserve`).
+    pub grown: u64,
+}
+
+/// When the writer compacts a list (`compactions_due`). Plain data.
+///
+/// A list with dead rows (deleted, or expired before `head`) is due when
+/// any of these holds:
+/// - its oldest dead row died `window_ticks` or more ticks ago (the rolling
+///   window: no dead row is kept much longer than that);
+/// - its dead rows are more than `max_dead_share` of its rows;
+/// - it has `max_dead_rows` dead rows or more.
+///
+/// At most `max_per_tick` lists are compacted per tick, oldest dead row
+/// first, then lower list index, so the writer's cost per tick is bounded
+/// and no due list waits forever.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompactPolicy {
+    pub window_ticks: u64,
+    pub max_dead_share: f32,
+    pub max_dead_rows: usize,
+    pub max_per_tick: usize,
+}
+
+/// One minute at 60 Hz; a quarter dead; two default blocks; two per tick.
+pub const COMPACT_DEFAULT: CompactPolicy = CompactPolicy {
+    window_ticks: 3600,
+    max_dead_share: 0.25,
+    max_dead_rows: 2 * DEFAULT_BLOCK_ROWS,
+    max_per_tick: 2,
+};
 
 fn empty_meta() -> ListMeta { ListMeta { blocks: Vec::new(), len: 0, head: 0, dead: 0, tomb: Vec::new() } }
+
+/// `dst = src`, reusing `dst`'s buffers: no allocation when `fits`.
+/// No block is freed either: every block is also held by the writer.
+fn copy_meta(dst: &mut ListMeta, src: &ListMeta) {
+    dst.blocks.clone_from(&src.blocks);
+    dst.tomb.clone_from(&src.tomb);
+    dst.len = src.len;
+    dst.head = src.head;
+    dst.dead = src.dead;
+}
+
+/// `copy_meta(dst, src)` would not allocate.
+fn fits(dst: &ListMeta, src: &ListMeta) -> bool {
+    dst.blocks.capacity() >= src.blocks.len() && dst.tomb.capacity() >= src.tomb.len()
+}
+
+/// `publish` into `v` would not allocate: every list changed since `v.seq` fits.
+fn view_fits(v: &View, lists: &[ListMeta], touched: &[u64]) -> bool {
+    touched.iter().enumerate().all(|(li, &t)| t <= v.seq || fits(&v.lists[li], &lists[li]))
+}
+
+/// Grow `dst`'s buffers to at least `src`'s capacity.
+fn fit(dst: &mut ListMeta, src: &ListMeta) {
+    dst.blocks.reserve(src.blocks.capacity().saturating_sub(dst.blocks.len()));
+    dst.tomb.reserve(src.tomb.capacity().saturating_sub(dst.tomb.len()));
+}
+
+/// A new pooled view of the writer's lists, fitted to their capacity.
+fn new_view(w_lists: &[ListMeta], seq: u64, max_ts: u64, block_rows: usize, model: &Arc<IvfPqIndex>) -> Arc<View> {
+    let mut lists = w_lists.to_vec();
+    for (d, s) in lists.iter_mut().zip(w_lists) { fit(d, s); }
+    Arc::new(View { seq, max_ts, block_rows, model: model.clone(), lists })
+}
 
 fn take_block(p: &mut Pool) -> Arc<Block> {
     match p.ready.pop() {
@@ -126,7 +249,8 @@ fn push_row(p: &mut Pool, l: &mut ListMeta, id: u64, ts: u64, tags: u64, codes: 
     r
 }
 
-/// Move retired blocks no view can see any more to `ready`.
+/// Move retired blocks no view can see any more to `ready`. No allocation:
+/// `ready` has room for every retired block (`compact_list`).
 fn reclaim(p: &mut Pool) {
     let mut i = 0;
     while i < p.retired.len() {
@@ -140,7 +264,8 @@ fn reclaim(p: &mut Pool) {
 }
 
 /// Writer over a copy of `idx` (rows, tombstones, heads, directory), with
-/// blocks of `block_rows` rows. Publishes `idx`'s state as view 0.
+/// blocks of `block_rows` rows (`DEFAULT_BLOCK_ROWS` unless there is a
+/// reason) and `DEFAULT_VIEWS` pooled views. Publishes `idx`'s state as view 0.
 pub fn writer_from(idx: &IvfPqIndex, block_rows: usize) -> Writer {
     assert!(block_rows > 0, "block_rows must be > 0");
     let model = Arc::new(live::empty_like(idx));
@@ -159,21 +284,24 @@ pub fn writer_from(idx: &IvfPqIndex, block_rows: usize) -> Writer {
         meta.dead = l.dead;
         lists.push(meta);
     }
-    let view = Arc::new(View { seq: 0, max_ts: idx.max_ts, block_rows, model: model.clone(), lists: lists.clone() });
+    let views: Vec<Arc<View>> = (0..DEFAULT_VIEWS).map(|_| new_view(&lists, 0, idx.max_ts, block_rows, &model)).collect();
     Writer {
         scratch: live::scratch_for(&model),
         touched: vec![0; lists.len()],
+        dead_since: lists.iter().map(|l| if l.dead > 0 { 0 } else { NEVER }).collect(),
         model, lists, dir: idx.dir.clone(), max_ts: idx.max_ts, seq: 1, pool,
-        views: vec![view.clone()],
-        latest: Arc::new(Mutex::new(view)),
+        latest: Arc::new(ArcSwap::new(views[0].clone())),
+        dirty: vec![false; views.len()],
+        views,
+        current: 0, pending: 0, deferred: 0, grown: 0,
     }
 }
 
 /// Handle for query threads.
 pub fn latest(w: &Writer) -> Latest { w.latest.clone() }
 
-/// The newest published view. Holding it keeps its rows readable.
-pub fn current(l: &Latest) -> Arc<View> { l.lock().unwrap_or_else(|e| e.into_inner()).clone() }
+/// The newest published view. Lock-free. Holding it keeps its rows readable.
+pub fn current(l: &Latest) -> Arc<View> { l.load_full() }
 
 /// Apply one op to the writer's state; visible to queries after `publish`.
 /// Same semantics and results as `live::apply`.
@@ -209,13 +337,20 @@ fn append(w: &mut Writer, id: u64, ts: u64, tags: u64, v: &[f32]) -> RowLoc {
     loc
 }
 
+/// Count one more dead row in list `li`, noting when its first one died.
+fn kill(l: &mut ListMeta, dead_since: &mut u64, seq: u64) {
+    if l.dead == 0 { *dead_since = seq; }
+    l.dead += 1;
+}
+
 /// Mark `id` dead. O(1).
 pub fn delete(w: &mut Writer, id: u64) -> Result<RowLoc, WriteError> {
     let loc = w.dir.remove(&id).ok_or(WriteError::NotFound { id })?;
-    let l = &mut w.lists[loc.list as usize];
+    let li = loc.list as usize;
+    let l = &mut w.lists[li];
     l.tomb[loc.row as usize] = 1;
-    l.dead += 1;
-    w.touched[loc.list as usize] = w.seq;
+    kill(l, &mut w.dead_since[li], w.seq);
+    w.touched[li] = w.seq;
     Ok(loc)
 }
 
@@ -238,7 +373,7 @@ pub fn expire(w: &mut Writer, before_ts: u64, max_rows: usize) -> (Vec<u64>, boo
             let r = l.head;
             if l.tomb[r] == 0 {
                 l.tomb[r] = 1;
-                l.dead += 1;
+                kill(l, &mut w.dead_since[li], w.seq);
                 let id = l.blocks[r / cap].id(r % cap);
                 w.dir.remove(&id);
                 ids.push(id);
@@ -252,15 +387,19 @@ pub fn expire(w: &mut Writer, before_ts: u64, max_rows: usize) -> (Vec<u64>, boo
 
 /// Rewrite `list` into fresh blocks keeping only live rows, and retire the
 /// old blocks. As `live::compact_list`; views that hold the old blocks keep
-/// reading them.
+/// reading them. Keeps the list's free room (`reserve`), so the inserts
+/// that room was made for still do not allocate.
 pub fn compact_list(w: &mut Writer, list: u32) -> Result<usize, WriteError> {
     let li = list as usize;
     if li >= w.lists.len() { return Err(WriteError::NoSuchList { list }); }
     let (cap, vdim) = (w.pool.cap, w.pool.vdim);
     let old = std::mem::replace(&mut w.lists[li], empty_meta());
+    let live = old.len - old.dead;
+    let free_rows = old.blocks.len() * cap - old.len;
+    let need_blocks = (live + free_rows + cap - 1) / cap;
     let new = &mut w.lists[li];
-    new.tomb.reserve_exact(old.len - old.dead);
-    new.blocks.reserve_exact((old.len - old.dead + cap - 1) / cap);
+    new.tomb.reserve_exact(live + (old.tomb.capacity() - old.len));
+    new.blocks.reserve_exact(need_blocks + (old.blocks.capacity() - old.blocks.len()));
     for r in old.head..old.len {
         if old.tomb[r] == 1 { continue; }
         let (b, s) = (&old.blocks[r / cap], r % cap);
@@ -268,14 +407,23 @@ pub fn compact_list(w: &mut Writer, list: u32) -> Result<usize, WriteError> {
         let row = push_row(&mut w.pool, new, b.id(s), b.ts(s), b.tags(s), b.code_row(s), vec);
         w.dir.insert(b.id(s), RowLoc { list, row: row as u32 });
     }
+    while new.blocks.len() < need_blocks { new.blocks.push(take_block(&mut w.pool)); }
     w.pool.retired.extend(old.blocks);
+    // `reclaim` moves retired blocks to `ready` without growing it.
+    w.pool.ready.reserve(w.pool.retired.len());
+    w.dirty.iter_mut().for_each(|d| *d = true);
+    w.dead_since[li] = NEVER;
     w.touched[li] = w.seq;
     Ok(old.dead)
 }
 
 /// Room for `rows_per_list` more rows in every list and in the directory,
-/// so the next inserts do not allocate. Call between ticks.
-pub fn reserve(w: &mut Writer, rows_per_list: usize) {
+/// so the next inserts do not allocate, and a pool of at least `views`
+/// views (max query threads holding a view at once + 2) whose buffers fit
+/// the writer's, so `publish` does not allocate either. Call between ticks,
+/// e.g. once per tick: a view that is held during one call is fitted by a
+/// later one (cheap when nothing grew).
+pub fn reserve(w: &mut Writer, rows_per_list: usize, views: usize) {
     let cap = w.pool.cap;
     for l in w.lists.iter_mut() {
         let need = (l.len + rows_per_list + cap - 1) / cap;
@@ -284,33 +432,116 @@ pub fn reserve(w: &mut Writer, rows_per_list: usize) {
         l.tomb.reserve(rows_per_list);
     }
     w.dir.reserve(rows_per_list * w.lists.len());
+    // A new view holds the writer's state now: the end of tick seq - 1, plus
+    // any ops of tick seq already applied, which `publish` copies again anyway.
+    w.views.reserve(views.saturating_sub(w.views.len()));
+    w.dirty.reserve(views.saturating_sub(w.dirty.len()));
+    while w.views.len() < views {
+        w.views.push(new_view(&w.lists, w.seq - 1, w.max_ts, cap, &w.model));
+        w.dirty.push(false);
+    }
+    for v in w.views.iter_mut() {
+        if let Some(v) = Arc::get_mut(v) {
+            for (d, s) in v.lists.iter_mut().zip(&w.lists) { fit(d, s); }
+        }
+    }
+    w.pool.ready.reserve(w.pool.retired.len());
 }
 
-/// End tick `w.seq`: publish its state as a view and return its seq.
-pub fn publish(w: &mut Writer) -> u64 {
-    let seq = w.seq;
-    let view = match w.views.iter_mut().position(|v| Arc::get_mut(v).is_some()) {
-        Some(i) => {
-            let mut v = w.views.swap_remove(i);
-            let dst = Arc::get_mut(&mut v).expect("unique");
-            for ((d, s), &t) in dst.lists.iter_mut().zip(&w.lists).zip(&w.touched) {
-                if t > dst.seq { d.clone_from(s); }
-            }
-            dst.seq = seq;
-            dst.max_ts = w.max_ts;
-            v
+/// Let free dirty views other than `skip` drop their handles to blocks a
+/// compaction may have retired, so an idle view does not pin them. Clears
+/// the block table of every list changed since the view's seq: those lists
+/// are copied again whenever the view is reused, and `clear` keeps the
+/// buffer. No allocation, no block freed (the writer holds every block).
+fn sweep(w: &mut Writer, skip: Option<usize>) {
+    for (i, v) in w.views.iter_mut().enumerate() {
+        if !w.dirty[i] || Some(i) == skip { continue; }
+        let Some(v) = Arc::get_mut(v) else { continue };
+        for (l, &t) in v.lists.iter_mut().zip(&w.touched) {
+            if t > v.seq { l.blocks.clear(); }
         }
-        None => Arc::new(View { seq, max_ts: w.max_ts, block_rows: w.pool.cap, model: w.model.clone(), lists: w.lists.clone() }),
-    };
-    w.views.push(view.clone());
-    let prev = std::mem::replace(&mut *w.latest.lock().unwrap_or_else(|e| e.into_inner()), view);
-    drop(prev); // still in `views`: never the last handle, so no free under the lock
+        w.dirty[i] = false;
+    }
+}
+
+/// End tick `w.seq`: publish its state as a view, or defer if every pooled
+/// view is held by a query. No allocation after `reserve`, deferred or not.
+pub fn publish(w: &mut Writer) -> Published {
+    let seq = w.seq;
     w.seq += 1;
-    // Keep one idle view as the next publish's buffer; the others would pin retired blocks.
-    let mut spare = false;
-    w.views.retain_mut(|v| Arc::get_mut(v).is_none() || !std::mem::replace(&mut spare, true));
+    // Free view to reuse: the newest (its lists are the fewest to copy and
+    // still in cache), lower index on ties. Only if it would have to grow
+    // (rare: it was held during the `reserve` that grew the writer), the
+    // newest one that fits instead, and if none fits, grow the newest.
+    let mut pick: Option<(u64, usize)> = None;
+    let mut fitting: Option<(u64, usize)> = None;
+    let newer = |a: (u64, usize), b: Option<(u64, usize)>| b.map_or(true, |b| a.0 > b.0 || (a.0 == b.0 && a.1 < b.1));
+    for (i, v) in w.views.iter_mut().enumerate() {
+        let Some(v) = Arc::get_mut(v) else { continue };
+        if newer((v.seq, i), pick) { pick = Some((v.seq, i)); }
+    }
+    let grow = match pick {
+        Some((_, i)) if !view_fits(&w.views[i], &w.lists, &w.touched) => {
+            for (i, v) in w.views.iter_mut().enumerate() {
+                let Some(v) = Arc::get_mut(v) else { continue };
+                if newer((v.seq, i), fitting) && view_fits(v, &w.lists, &w.touched) { fitting = Some((v.seq, i)); }
+            }
+            fitting.is_none()
+        }
+        _ => false,
+    };
+    sweep(w, fitting.or(pick).map(|p| p.1));
+    let Some((_, i)) = fitting.or(pick) else {
+        // Every view is held: keep the current one; the next publish covers this tick too.
+        w.pending += 1;
+        w.deferred += 1;
+        reclaim(&mut w.pool);
+        return Published { seq, current: w.current, deferred: w.pending };
+    };
+    if grow { w.grown += 1; }
+    let dst = Arc::get_mut(&mut w.views[i]).expect("free view");
+    for ((d, s), &t) in dst.lists.iter_mut().zip(&w.lists).zip(&w.touched) {
+        if t > dst.seq { copy_meta(d, s); }
+    }
+    dst.seq = seq;
+    dst.max_ts = w.max_ts;
+    // The old view stays in `views`: never the last handle, so `store` frees nothing.
+    w.latest.store(w.views[i].clone());
+    w.dirty[i] = false;
+    w.current = seq;
+    w.pending = 0;
     reclaim(&mut w.pool);
-    seq
+    Published { seq, current: seq, deferred: 0 }
+}
+
+/// Lists to compact this tick under `p`, as `Op::Compact`s in `out`
+/// (cleared first). The writer applies them with `apply` like any other op,
+/// so they go into the log. Pure: depends only on the lists' row and dead
+/// counts, `dead_since` and `seq`, all of which the op log determines.
+/// No allocation if `out` has room for `p.max_per_tick` ops.
+pub fn compactions_due(p: &CompactPolicy, w: &Writer, out: &mut Vec<Op>) {
+    out.clear();
+    let due = |li: usize| {
+        let (l, since) = (&w.lists[li], w.dead_since[li]);
+        l.dead > 0
+            && (w.seq.saturating_sub(since) >= p.window_ticks
+                || l.dead >= p.max_dead_rows
+                || l.dead as f32 > p.max_dead_share * l.len as f32)
+    };
+    // Up to `max_per_tick` smallest (dead_since, list) keys among due
+    // lists, by repeated scans: no sort buffer, and max_per_tick is small.
+    let mut last: Option<(u64, usize)> = None;
+    for _ in 0..p.max_per_tick {
+        let mut best: Option<(u64, usize)> = None;
+        for li in 0..w.lists.len() {
+            let key = (w.dead_since[li], li);
+            if last.map_or(false, |k| key <= k) || best.map_or(false, |b| key >= b) || !due(li) { continue; }
+            best = Some(key);
+        }
+        let Some(b) = best else { break };
+        out.push(Op::Compact { list: b.1 as u32 });
+        last = best;
+    }
 }
 
 pub fn locate(w: &Writer, id: u64) -> Option<RowLoc> { w.dir.get(&id).copied() }
@@ -318,7 +549,10 @@ pub fn locate(w: &Writer, id: u64) -> Option<RowLoc> { w.dir.get(&id).copied() }
 pub fn live_rows(w: &Writer) -> usize { w.dir.len() }
 
 pub fn arena_stats(w: &Writer) -> ArenaStats {
-    ArenaStats { allocated: w.pool.allocated, ready: w.pool.ready.len(), retired: w.pool.retired.len(), views: w.views.len() }
+    ArenaStats {
+        allocated: w.pool.allocated, ready: w.pool.ready.len(), retired: w.pool.retired.len(), views: w.views.len(),
+        deferred: w.deferred, grown: w.grown,
+    }
 }
 
 impl ListRows for View {
