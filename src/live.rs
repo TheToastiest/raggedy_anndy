@@ -16,7 +16,7 @@
 //!
 //! Design: "IVF-PQ live insert and delete design" (project doc), stage 1.
 
-use crate::ivfpq::{coarse_score, empty_list, norm_inplace, IvfPqIndex, RowLoc};
+use crate::ivfpq::{empty_list, nearest_centroid, norm_inplace, IvfPqIndex, RowLoc};
 use crate::metric::Metric;
 
 /// One write. The log of these is the source of truth for the index.
@@ -92,16 +92,10 @@ pub(crate) fn check_row(dim: usize, max_ts: u64, id: u64, ts: u64, v: &[f32]) ->
     Ok(())
 }
 
-/// Nearest list for an already-normalised vector. Same score and tie rule
-/// (lower list index wins) as `build`'s assignment.
+/// Nearest list for an already-normalised vector: `build`'s assignment
+/// (`nearest_centroid`, 4-wide, lower list index wins ties).
 fn nearest(metric: Metric, v: &[f32], centroids: &[Vec<f32>]) -> usize {
-    let mut best = 0usize;
-    let mut bs = f32::NEG_INFINITY;
-    for (j, c) in centroids.iter().enumerate() {
-        let sc = coarse_score(metric, v, c);
-        if sc > bs { bs = sc; best = j; }
-    }
-    best
+    nearest_centroid(metric, v, centroids.len(), |j| &centroids[j][..])
 }
 
 /// List an insert of `v` would land in.
