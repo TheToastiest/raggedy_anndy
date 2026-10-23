@@ -34,14 +34,15 @@ insert/delete/upsert after `reserve`).
 Measured insert cost on the dev container, one thread, release build
 (`insert_latency`, ignored by default):
 
-| N | dim | nlist | m | p50 | p99 |
+| N | dim | nlist | m | scalar scan p50 / p99 | 4-wide scan p50 / p99 |
 | --- | --- | --- | --- | --- | --- |
-| 100k | 128 | 256 | 32 | 50 us | 107 us |
-| 100k | 256 | 1024 | 32 | 319 us | 525 us |
+| 100k | 128 | 256 | 32 | 52 us / 95 us | 26 us / 51 us |
+| 100k | 256 | 1024 | 32 | 192 us / 468 us | 101 us / 269 us |
 
-At 10 inserts per tick, dim 256 / nlist 1024 costs ~3.2 ms of the writer
-thread per tick. The centroid scan is scalar; using the existing 4-wide dot
-kernel there is the first speed-up to try.
+The centroid scan now uses the 4-wide kernel (`ivfpq::nearest_centroid`,
+shared with `build`'s assignment; same scores bit for bit, same tie rule).
+At 10 inserts per tick, dim 256 / nlist 1024 costs ~1 ms of the writer
+thread per tick.
 
 ## Stage 2: separate query threads
 
