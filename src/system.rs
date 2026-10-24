@@ -93,9 +93,12 @@ pub fn start(idx: &IvfPqIndex, block_rows: usize) -> System {
 }
 
 /// A system from its parts (a loaded snapshot): rows `idx` (directory
-/// rebuilt), the writer's tick and `dead_since`, and the rest.
+/// rebuilt), the writer's tick and `dead_since`, and the rest. The
+/// pending buffer's rows go to the writer's view side too, so the first
+/// view already searches them.
 pub fn from_parts(idx: &IvfPqIndex, block_rows: usize, tick_next: u64, dead_since: Vec<u64>, st: State) -> System {
-    let mut w = views::writer_from(idx, block_rows);
+    let b = &st.buf;
+    let mut w = views::writer_with_pending(idx, block_rows, &b.ids, &b.timestamps, &b.tags, &b.view);
     w.seq = tick_next;
     w.dead_since = dead_since;
     System { w, st, carry: None }

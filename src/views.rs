@@ -47,6 +47,18 @@
 //! op, so they are in the log and replay. This is also what frees the
 //! memory of expired rows.
 //!
+//! Pending real memories (stage 5): the writer keeps a copy of the
+//! pending buffer's rows (`real_memory::Pending`: id, ts, tags, scored
+//! vector) in blocks of its own (no PQ codes), with a tombstone per row
+//! and the live pending ids sorted. `real_memory::apply_writer` keeps it
+//! in step with the buffer (`pending_push`, `pending_kill`,
+//! `pending_clear`); a view gets a copy of its metadata at `publish`, like
+//! a list, so the view of tick T holds the buffer as it was at the end of
+//! T. `search_temporal` on a view scans those rows exactly, as
+//! `real_memory::search` does, and gives bit-identical results to it on
+//! (`to_index(view)`, buffer at T). The commit retires the blocks, which
+//! are reclaimed like compacted ones.
+//!
 //! Results: search runs `ivfpq::search_rows`, the same scoring code as
 //! `IvfPqIndex::search_temporal`, over the view's blocks. A query's result
 //! is a function of (query, view seq): the same op log cut into the same
@@ -63,8 +75,10 @@ use arc_swap::ArcSwap;
 
 use crate::arena::Block;
 use crate::ivfpq::{fingerprint_head, fnv, search_rows, IvfPqIndex, ListRows, RowLoc, Run};
+use crate::ivfpq::{apply_decay, norm_inplace};
 use crate::live::{self, Applied, Op, Scratch, WriteError};
-use crate::types::Hit;
+use crate::metric::{self, Metric};
+use crate::types::{stable_top_k, Hit};
 
 /// Rows per block unless the caller picks another size.
 pub const DEFAULT_BLOCK_ROWS: usize = 256;
@@ -97,6 +111,13 @@ pub struct View {
     /// Centroids, OPQ, codebooks and params; no rows (`live::empty_like`).
     pub model: Arc<IvfPqIndex>,
     pub lists: Vec<ListMeta>,
+    /// Pending real memories at the end of tick `seq`: rows in blocks with
+    /// no codes and the scored vector (`real_memory::Pending::view`); `head` is 0.
+    pub pending: ListMeta,
+    /// Ids of the live rows of `pending`, ascending.
+    pub pending_ids: Vec<u64>,
+    /// How many of `pending_ids` also have a live row in this view's lists.
+    pub pending_in_lists: usize,
 }
 
 /// Where query threads get the newest view (`current`).
@@ -133,6 +154,17 @@ pub struct Writer {
     /// swept, so it may still hold retired blocks.
     dirty: Vec<bool>,
     latest: Latest,
+    /// Copy of the pending real-memory buffer (see the module doc).
+    pend: ListMeta,
+    /// Live pending ids ascending, and each one's row in `pend`.
+    pend_ids: Vec<u64>,
+    pend_rows: Vec<u32>,
+    /// Seq of the tick that last changed `pend`.
+    pend_touched: u64,
+    /// How many pending ids are also in `dir` (live in the lists).
+    pend_in_dir: usize,
+    /// Blocks of `pend`: no codes, a vector of `dim` floats.
+    ppool: Pool,
     /// Seq of the view in `latest`.
     current: u64,
     /// Publishes deferred: in a row (since the last one that published), and in total.
@@ -214,8 +246,9 @@ fn fits(dst: &ListMeta, src: &ListMeta) -> bool {
 }
 
 /// `publish` into `v` would not allocate: every list changed since `v.seq` fits.
-fn view_fits(v: &View, lists: &[ListMeta], touched: &[u64]) -> bool {
-    touched.iter().enumerate().all(|(li, &t)| t <= v.seq || fits(&v.lists[li], &lists[li]))
+fn view_fits(v: &View, w: &Writer) -> bool {
+    w.touched.iter().enumerate().all(|(li, &t)| t <= v.seq || fits(&v.lists[li], &w.lists[li]))
+        && (w.pend_touched <= v.seq || (fits(&v.pending, &w.pend) && v.pending_ids.capacity() >= w.pend_ids.len()))
 }
 
 /// Grow `dst`'s buffers to at least `src`'s capacity.
@@ -224,11 +257,16 @@ fn fit(dst: &mut ListMeta, src: &ListMeta) {
     dst.tomb.reserve(src.tomb.capacity().saturating_sub(dst.tomb.len()));
 }
 
-/// A new pooled view of the writer's lists, fitted to their capacity.
-fn new_view(w_lists: &[ListMeta], seq: u64, max_ts: u64, block_rows: usize, model: &Arc<IvfPqIndex>) -> Arc<View> {
+/// A new pooled view of the writer's lists and pending rows, fitted to their capacity.
+#[allow(clippy::too_many_arguments)]
+fn new_view(w_lists: &[ListMeta], pend: &ListMeta, pend_ids: &[u64], seq: u64, max_ts: u64, block_rows: usize, model: &Arc<IvfPqIndex>) -> Arc<View> {
     let mut lists = w_lists.to_vec();
     for (d, s) in lists.iter_mut().zip(w_lists) { fit(d, s); }
-    Arc::new(View { seq, max_ts, block_rows, model: model.clone(), lists })
+    let mut pending = pend.clone();
+    fit(&mut pending, pend);
+    let mut ids = Vec::with_capacity(pend_ids.len().max(pend.tomb.capacity()));
+    ids.extend_from_slice(pend_ids);
+    Arc::new(View { seq, max_ts, block_rows, model: model.clone(), lists, pending, pending_ids: ids, pending_in_lists: 0 })
 }
 
 fn take_block(p: &mut Pool) -> Arc<Block> {
@@ -267,7 +305,15 @@ fn reclaim(p: &mut Pool) {
 /// blocks of `block_rows` rows (`DEFAULT_BLOCK_ROWS` unless there is a
 /// reason) and `DEFAULT_VIEWS` pooled views. Publishes `idx`'s state as view 0.
 pub fn writer_from(idx: &IvfPqIndex, block_rows: usize) -> Writer {
+    writer_with_pending(idx, block_rows, &[], &[], &[], &[])
+}
+
+/// `writer_from`, plus the pending real-memory rows of a loaded buffer
+/// (`real_memory::Pending`'s `ids`, `timestamps`, `tags` and scored
+/// `view` vectors, row-major), so view 0 already searches them.
+pub fn writer_with_pending(idx: &IvfPqIndex, block_rows: usize, ids: &[u64], ts: &[u64], tags: &[u64], vecs: &[f32]) -> Writer {
     assert!(block_rows > 0, "block_rows must be > 0");
+    assert!(ts.len() == ids.len() && tags.len() == ids.len() && vecs.len() == ids.len() * idx.dim, "pending column lengths");
     let model = Arc::new(live::empty_like(idx));
     let (m, dim) = (idx.params.m, idx.dim);
     let vdim = if idx.params.store_vecs { dim } else { 0 };
@@ -284,8 +330,24 @@ pub fn writer_from(idx: &IvfPqIndex, block_rows: usize) -> Writer {
         meta.dead = l.dead;
         lists.push(meta);
     }
-    let views: Vec<Arc<View>> = (0..DEFAULT_VIEWS).map(|_| new_view(&lists, 0, idx.max_ts, block_rows, &model)).collect();
+    let mut ppool = Pool { cap: block_rows, m: 0, vdim: dim, ready: Vec::new(), retired: Vec::new(), allocated: 0 };
+    let mut pend = empty_meta();
+    let mut pend_dir: Vec<(u64, u32)> = Vec::with_capacity(ids.len());
+    for (i, &id) in ids.iter().enumerate() {
+        let r = push_row(&mut ppool, &mut pend, id, ts[i], tags[i], &[], &vecs[i * dim..(i + 1) * dim]);
+        pend_dir.push((id, r as u32));
+    }
+    pend_dir.sort_unstable();
+    let pend_ids: Vec<u64> = pend_dir.iter().map(|p| p.0).collect();
+    let pend_rows: Vec<u32> = pend_dir.iter().map(|p| p.1).collect();
+    let pend_in_dir = pend_ids.iter().filter(|id| idx.dir.contains_key(id)).count();
+    let views: Vec<Arc<View>> = (0..DEFAULT_VIEWS).map(|_| {
+        let mut v = new_view(&lists, &pend, &pend_ids, 0, idx.max_ts, block_rows, &model);
+        Arc::get_mut(&mut v).expect("new view").pending_in_lists = pend_in_dir;
+        v
+    }).collect();
     Writer {
+        pend, pend_ids, pend_rows, pend_touched: 0, pend_in_dir, ppool,
         scratch: live::scratch_for(&model),
         touched: vec![0; lists.len()],
         dead_since: lists.iter().map(|l| if l.dead > 0 { 0 } else { NEVER }).collect(),
@@ -332,6 +394,7 @@ fn append(w: &mut Writer, id: u64, ts: u64, tags: u64, v: &[f32]) -> RowLoc {
     let row = push_row(&mut w.pool, &mut w.lists[li], id, ts, tags, &w.scratch.codes, vec);
     let loc = RowLoc { list: li as u32, row: row as u32 };
     w.dir.insert(id, loc);
+    if w.pend_ids.binary_search(&id).is_ok() { w.pend_in_dir += 1; }
     w.max_ts = ts;
     w.touched[li] = w.seq;
     loc
@@ -346,6 +409,7 @@ fn kill(l: &mut ListMeta, dead_since: &mut u64, seq: u64) {
 /// Mark `id` dead. O(1).
 pub fn delete(w: &mut Writer, id: u64) -> Result<RowLoc, WriteError> {
     let loc = w.dir.remove(&id).ok_or(WriteError::NotFound { id })?;
+    if w.pend_ids.binary_search(&id).is_ok() { w.pend_in_dir -= 1; }
     let li = loc.list as usize;
     let l = &mut w.lists[li];
     l.tomb[loc.row as usize] = 1;
@@ -376,6 +440,7 @@ pub fn expire(w: &mut Writer, before_ts: u64, max_rows: usize) -> (Vec<u64>, boo
                 kill(l, &mut w.dead_since[li], w.seq);
                 let id = l.blocks[r / cap].id(r % cap);
                 w.dir.remove(&id);
+                if w.pend_ids.binary_search(&id).is_ok() { w.pend_in_dir -= 1; }
                 ids.push(id);
             }
             l.head += 1;
@@ -437,16 +502,91 @@ pub fn reserve(w: &mut Writer, rows_per_list: usize, views: usize) {
     w.views.reserve(views.saturating_sub(w.views.len()));
     w.dirty.reserve(views.saturating_sub(w.dirty.len()));
     while w.views.len() < views {
-        w.views.push(new_view(&w.lists, w.seq - 1, w.max_ts, cap, &w.model));
+        let mut v = new_view(&w.lists, &w.pend, &w.pend_ids, w.seq - 1, w.max_ts, cap, &w.model);
+        Arc::get_mut(&mut v).expect("new view").pending_in_lists = w.pend_in_dir;
+        w.views.push(v);
         w.dirty.push(false);
     }
+    fit_views(w);
+    w.pool.ready.reserve(w.pool.retired.len());
+}
+
+/// Grow every free pooled view's buffers to the writer's capacity.
+fn fit_views(w: &mut Writer) {
+    let ids_cap = w.pend_ids.capacity();
     for v in w.views.iter_mut() {
         if let Some(v) = Arc::get_mut(v) {
             for (d, s) in v.lists.iter_mut().zip(&w.lists) { fit(d, s); }
+            fit(&mut v.pending, &w.pend);
+            v.pending_ids.reserve(ids_cap.saturating_sub(v.pending_ids.len()));
         }
     }
-    w.pool.ready.reserve(w.pool.retired.len());
 }
+
+/// Room for `rows` more pending real memories (`real_memory::apply_writer`
+/// inserts and upserts of real ids), in the writer and in every free
+/// pooled view, so they and `publish` do not allocate. Call between ticks,
+/// with `reserve`; pair it with `real_memory::reserve` on the buffer.
+pub fn reserve_pending(w: &mut Writer, rows: usize) {
+    let cap = w.ppool.cap;
+    let l = &mut w.pend;
+    let need = (l.len + rows).div_ceil(cap);
+    l.blocks.reserve(need.saturating_sub(l.blocks.len()));
+    while l.blocks.len() < need { l.blocks.push(take_block(&mut w.ppool)); }
+    l.tomb.reserve(rows);
+    w.pend_ids.reserve(rows);
+    w.pend_rows.reserve(rows);
+    fit_views(w);
+    w.ppool.ready.reserve(w.ppool.retired.len());
+}
+
+/// Add a pending real memory (`v` is its scored vector: unit length for
+/// cosine). The id must not be pending already. Called by
+/// `real_memory::apply_writer` right after the buffer's own push.
+pub fn pending_push(w: &mut Writer, id: u64, ts: u64, tags: u64, v: &[f32]) {
+    let at = w.pend_ids.binary_search(&id).expect_err("id already pending");
+    let r = push_row(&mut w.ppool, &mut w.pend, id, ts, tags, &[], v);
+    w.pend_ids.insert(at, id);
+    w.pend_rows.insert(at, r as u32);
+    if w.dir.contains_key(&id) { w.pend_in_dir += 1; }
+    w.pend_touched = w.seq;
+}
+
+/// Drop pending id `id` (deleted, or replaced by an upsert). Returns
+/// whether it was pending. O(pending) for the sorted id list.
+pub fn pending_kill(w: &mut Writer, id: u64) -> bool {
+    let Ok(at) = w.pend_ids.binary_search(&id) else { return false };
+    let r = w.pend_rows[at] as usize;
+    w.pend_ids.remove(at);
+    w.pend_rows.remove(at);
+    if w.dir.contains_key(&id) { w.pend_in_dir -= 1; }
+    w.pend.tomb[r] = 1;
+    w.pend.dead += 1;
+    w.pend_touched = w.seq;
+    true
+}
+
+/// Empty the pending rows (the commit). Their blocks are retired and
+/// reused once no view holds them. Keeps every buffer's capacity.
+pub fn pending_clear(w: &mut Writer) {
+    if w.pend.len == 0 { return; }
+    w.ppool.retired.extend(w.pend.blocks.drain(..));
+    w.ppool.ready.reserve(w.ppool.retired.len());
+    w.pend.tomb.clear();
+    w.pend.len = 0;
+    w.pend.dead = 0;
+    w.pend_ids.clear();
+    w.pend_rows.clear();
+    w.pend_in_dir = 0;
+    w.dirty.iter_mut().for_each(|d| *d = true);
+    w.pend_touched = w.seq;
+}
+
+/// Live pending real memories in the writer's current state.
+pub fn writer_pending_rows(w: &Writer) -> usize { w.pend_ids.len() }
+
+/// Live pending real memories this view searches.
+pub fn pending_rows(v: &View) -> usize { v.pending_ids.len() }
 
 /// Let free dirty views other than `skip` drop their handles to blocks a
 /// compaction may have retired, so an idle view does not pin them. Clears
@@ -460,6 +600,7 @@ fn sweep(w: &mut Writer, skip: Option<usize>) {
         for (l, &t) in v.lists.iter_mut().zip(&w.touched) {
             if t > v.seq { l.blocks.clear(); }
         }
+        if w.pend_touched > v.seq { v.pending.blocks.clear(); }
         w.dirty[i] = false;
     }
 }
@@ -481,10 +622,12 @@ pub fn publish(w: &mut Writer) -> Published {
         if newer((v.seq, i), pick) { pick = Some((v.seq, i)); }
     }
     let grow = match pick {
-        Some((_, i)) if !view_fits(&w.views[i], &w.lists, &w.touched) => {
-            for (i, v) in w.views.iter_mut().enumerate() {
-                let Some(v) = Arc::get_mut(v) else { continue };
-                if newer((v.seq, i), fitting) && view_fits(v, &w.lists, &w.touched) { fitting = Some((v.seq, i)); }
+        Some((_, i)) if !view_fits(&w.views[i], w) => {
+            for i in 0..w.views.len() {
+                let v = &w.views[i];
+                // Free: only the pool holds it (the slot never holds a free view).
+                if Arc::strong_count(v) != 1 { continue; }
+                if newer((v.seq, i), fitting) && view_fits(v, w) { fitting = Some((v.seq, i)); }
             }
             fitting.is_none()
         }
@@ -496,6 +639,7 @@ pub fn publish(w: &mut Writer) -> Published {
         w.pending += 1;
         w.deferred += 1;
         reclaim(&mut w.pool);
+        reclaim(&mut w.ppool);
         return Published { seq, current: w.current, deferred: w.pending };
     };
     if grow { w.grown += 1; }
@@ -503,6 +647,11 @@ pub fn publish(w: &mut Writer) -> Published {
     for ((d, s), &t) in dst.lists.iter_mut().zip(&w.lists).zip(&w.touched) {
         if t > dst.seq { copy_meta(d, s); }
     }
+    if w.pend_touched > dst.seq {
+        copy_meta(&mut dst.pending, &w.pend);
+        dst.pending_ids.clone_from(&w.pend_ids);
+    }
+    dst.pending_in_lists = w.pend_in_dir;
     dst.seq = seq;
     dst.max_ts = w.max_ts;
     // The old view stays in `views`: never the last handle, so `store` frees nothing.
@@ -511,6 +660,7 @@ pub fn publish(w: &mut Writer) -> Published {
     w.current = seq;
     w.pending = 0;
     reclaim(&mut w.pool);
+    reclaim(&mut w.ppool);
     Published { seq, current: seq, deferred: 0 }
 }
 
@@ -557,7 +707,9 @@ pub fn arena_stats(w: &Writer) -> ArenaStats {
 
 /// The view in the slot holds exactly the writer's state: the last
 /// publish went through and nothing was applied since.
-pub fn is_current(w: &Writer) -> bool { w.current + 1 == w.seq && w.touched.iter().all(|&t| t <= w.current) }
+pub fn is_current(w: &Writer) -> bool {
+    w.current + 1 == w.seq && w.touched.iter().all(|&t| t <= w.current) && w.pend_touched <= w.current
+}
 
 /// Rows per block.
 pub fn block_rows(w: &Writer) -> usize { w.pool.cap }
@@ -585,6 +737,14 @@ pub fn rebase(w: &mut Writer, idx: &IvfPqIndex) {
     n.pending = w.pending;
     n.deferred = w.deferred;
     n.grown = w.grown;
+    // The pending rows do not depend on the model: they move over as they are.
+    std::mem::swap(&mut n.pend, &mut w.pend);
+    std::mem::swap(&mut n.pend_ids, &mut w.pend_ids);
+    std::mem::swap(&mut n.pend_rows, &mut w.pend_rows);
+    std::mem::swap(&mut n.ppool, &mut w.ppool);
+    n.pend_touched = n.seq;
+    n.pend_in_dir = n.pend_ids.iter().filter(|id| n.dir.contains_key(id)).count();
+    fit_views(&mut n);
     *w = n;
 }
 
@@ -599,9 +759,59 @@ impl ListRows for View {
     #[inline] fn vec_row(&self, li: usize, r: usize) -> &[f32] { self.lists[li].blocks[r / self.block_rows].vec_row(r % self.block_rows) }
 }
 
-/// As `IvfPqIndex::search_temporal`, on this view's rows.
+/// Top-k over this view's short-term rows and its pending real memories,
+/// by (score desc, id asc), each id at most once: `real_memory::search`
+/// on (`to_index(v)`, the buffer at `v.seq`), bit for bit. With no pending
+/// rows, exactly `IvfPqIndex::search_temporal` on `to_index(v)`.
 pub fn search_temporal(v: &View, q: &[f32], k: usize, required_tag: Option<u64>, current_time: u64, lambda: f32) -> Vec<Hit> {
-    search_rows(&v.model, v, q, k, required_tag, current_time, lambda)
+    if v.pending_ids.is_empty() { return search_rows(&v.model, v, q, k, required_tag, current_time, lambda); }
+    if k == 0 || q.iter().any(|x| !x.is_finite()) { return Vec::new(); }
+    // k + (pending ids still in the lists) from the index, so dropping
+    // them still leaves k. Pending rows past the 1-hour expiry cost nothing.
+    let mut hits = search_rows(&v.model, v, q, k + v.pending_in_lists, required_tag, current_time, lambda);
+    hits.retain(|h| v.pending_ids.binary_search(&h.id).is_err());
+    let mut q_eff = q.to_vec();
+    if matches!(v.model.metric, Metric::Cosine) { norm_inplace(&mut q_eff); }
+    pending_hits(v, &q_eff, required_tag, current_time, lambda, &mut hits);
+    stable_top_k(hits, k)
+}
+
+/// Exact scores of the view's live pending rows that pass the tag filter,
+/// appended to `out`. Same arithmetic as `real_memory::search`'s scan;
+/// four rows per kernel call (bit-identical to one at a time).
+fn pending_hits(v: &View, q_eff: &[f32], required_tag: Option<u64>, current_time: u64, lambda: f32, out: &mut Vec<Hit>) {
+    let l = &v.pending;
+    let cosine = matches!(v.model.metric, Metric::Cosine);
+    let score4 = |rs: [&[f32]; 4]| if cosine { metric::dot_x4(q_eff, rs) } else {
+        let d = metric::l2_distance_x4(q_eff, rs); [-d[0], -d[1], -d[2], -d[3]]
+    };
+    let score1 = |r: &[f32]| if cosine { metric::dot(q_eff, r) } else { -metric::l2_distance(q_eff, r) };
+    // Up to 4 eligible rows (id, ts, vector) waiting for one kernel call.
+    let mut batch: [(u64, u64, &[f32]); 4] = [(0, 0, &[]); 4];
+    let mut nb = 0;
+    let cap = v.block_rows;
+    let mut r = 0;
+    while r < l.len {
+        let b = &l.blocks[r / cap];
+        let run = b.rows(0, cap.min(l.len - r));
+        for s in 0..run.ids.len() {
+            if l.tomb[r + s] == 1 { continue; }
+            if let Some(mask) = required_tag {
+                if run.tags[s] & mask == 0 { continue; }
+            }
+            batch[nb] = (run.ids[s], run.ts[s], b.vec_row(s));
+            nb += 1;
+            if nb == 4 {
+                let sc = score4([batch[0].2, batch[1].2, batch[2].2, batch[3].2]);
+                for j in 0..4 { out.push(Hit { id: batch[j].0, score: apply_decay(sc[j], batch[j].1, current_time, lambda) }); }
+                nb = 0;
+            }
+        }
+        r += run.ids.len();
+    }
+    for &(id, ts, row) in &batch[..nb] {
+        out.push(Hit { id, score: apply_decay(score1(row), ts, current_time, lambda) });
+    }
 }
 
 pub fn search(v: &View, q: &[f32], k: usize) -> Vec<Hit> { search_temporal(v, q, k, None, 0, 0.0) }
