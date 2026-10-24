@@ -492,12 +492,23 @@ ops at the 10-per-tick ceiling, so recovery is the snapshot load plus at
 most ~3.5 / 8.5 s of replay (plus a rebuild per decision in the tail).
 
 Open:
-- `system::begin_rebuild` still copies the live rows on the writer thread
-  (stage 3 cost, 54-108 ms at 100k); it could read a pinned view too.
+- Done (2026-10-24): rebuild copies moved off the writer thread. The
+  writer calls `system::capture_rows` (block handles + tombstones) and
+  `system::swap_prepared` (`views::adopt`, O(lists)); the worker runs
+  `snapshot_of`, `rebuild`, the gate, `prepare` and `catch_up_prepared`
+  (in pieces, from `carry_since`), and drops the returned
+  `views::Retired` after the next publish. The gate encodes on all its
+  threads. Results are bit-identical to the old path (tests pin master's
+  values). 4-thread dev box, 128-dim, nlist 1024, m 32
+  (`tests/rebuild_cost.rs`):
+
+  | rows | writer, old: snapshot / swap | writer, new: capture / swap | gate 1 thread / 4 threads |
+  | --- | --- | --- | --- |
+  | 100k | 47 ms / 83 ms | 0.37 ms / 0.10 ms | 18.8 s / 5.3 s |
+  | 500k | 238 ms / 121 ms | 0.80 ms / 0.03 ms | 91 s / 26 s |
+  | 2.16M | 2.23 s / 0.69 s | 2.3 ms / 0.71 ms | 411 s / 119 s |
 - The merged real-memory search (`real_memory::search`) runs on an
   `IvfPqIndex`; query threads on views do not see the pending buffer yet.
-- A swap (`views::rebase`) copies every row into new blocks on the writer
-  thread; rare, but O(rows).
 
 ## Stage 5: real memories to PostgreSQL
 

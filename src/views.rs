@@ -720,16 +720,35 @@ pub fn block_rows(w: &Writer) -> usize { w.pool.cap }
 pub fn scratch(w: &Writer) -> &Scratch { &w.scratch }
 
 /// Swap in a rebuilt model (stage 3): replace the writer's model, rows and
-/// directory with `idx`'s (the caught-up rebuild), keeping the tick (`seq`)
-/// and the query handle. Queries keep the current view (old model and
-/// blocks) until the next `publish`, which shows the new model. Lists that
-/// arrive with dead rows count them as dead since this tick
-/// (`dead_since = seq`), so the compaction policy is a function of the log.
-/// O(rows) and allocates: every row is copied into new blocks once. The old
-/// pool's views and blocks are freed when the last holder drops them (the
-/// view in the slot at the next `publish`, on the writer thread).
+/// directory with `idx`'s (the caught-up rebuild). `adopt` of
+/// `writer_from(idx, block_rows(w))`, the old state dropped here. O(rows)
+/// and allocates: every row is copied into new blocks once. For the writer
+/// thread, build the new writer elsewhere and `adopt` it.
 pub fn rebase(w: &mut Writer, idx: &IvfPqIndex) {
-    let mut n = writer_from(idx, w.pool.cap);
+    let n = writer_from(idx, w.pool.cap);
+    drop(adopt(w, n));
+}
+
+/// What `adopt` replaced: the old writer (its blocks, directory and view
+/// pool) and the view queries were reading. Dropping it frees whatever no
+/// query still holds, so drop it off the writer thread, after the next
+/// `publish` (until then the slot holds that view too).
+pub struct Retired {
+    pub writer: Writer,
+    pub view: Arc<View>,
+}
+
+/// Replace the writer's model, rows and directory with `n`'s, keeping the
+/// tick (`seq`), the query handle and the publish counters. `n` is a
+/// writer over the rebuilt rows (`writer_from` on any thread, plus any
+/// writes since), with `w`'s block size. Queries keep the current view
+/// (old model and blocks) until the next `publish`, which shows the new
+/// model. Lists that arrive with dead rows count them as dead since this
+/// tick (`dead_since = seq`), so the compaction policy is a function of the
+/// log. O(lists); no row is copied, nothing is allocated but `dead_since`,
+/// nothing is freed.
+pub fn adopt(w: &mut Writer, mut n: Writer) -> Retired {
+    assert_eq!(n.pool.cap, w.pool.cap, "block size");
     n.seq = w.seq;
     n.dead_since = n.lists.iter().map(|l| if l.dead > 0 { w.seq } else { NEVER }).collect();
     n.latest = w.latest.clone();
@@ -745,7 +764,8 @@ pub fn rebase(w: &mut Writer, idx: &IvfPqIndex) {
     n.pend_touched = n.seq;
     n.pend_in_dir = n.pend_ids.iter().filter(|id| n.dir.contains_key(id)).count();
     fit_views(&mut n);
-    *w = n;
+    let view = current(&w.latest);
+    Retired { writer: std::mem::replace(w, n), view }
 }
 
 impl ListRows for View {
