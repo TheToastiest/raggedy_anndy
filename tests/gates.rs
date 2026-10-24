@@ -33,6 +33,7 @@ use raggedy_anndy::eval::wilson_lower_bound;
 use raggedy_anndy::par::parallel_map_indexed;
 use raggedy_anndy::pick::{pick_ranked, pick_seed, PICK_DEFAULT, TOP_K_DEFAULT};
 use raggedy_anndy::seed::SplitMix64;
+use raggedy_anndy::views;
 use raggedy_anndy::{FlatIndex, Hit, IvfPqIndex, IvfPqParams, Metric};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -335,6 +336,103 @@ fn pick_latency_n100k() { pick_gate(100_000); }
 #[test]
 #[ignore = "SLOW: 1M build (~2 min) + exact truth, ~2.5 GB RAM"]
 fn pick_latency_n1m() { pick_gate(1_000_000); }
+
+// ------------------------------------------------------------------ pending
+// View queries also scan the pending real-memory buffer (exact, every
+// pending row) and ask the index for k + pending hits, so pending ids are
+// dropped from the index side without leaving fewer than k. Same gates,
+// measured on `views::search_temporal` over a published view of the
+// fixture plus PENDING_GATE real memories whose short-term rows have
+// expired (the worst case: every pending hit comes from the buffer).
+// Expected pending size is not known yet (real memories per 12 h), so the
+// gate uses PENDING_GATE and `pending_sweep` prints larger sizes.
+
+const PENDING_GATE: usize = 1_024;
+
+/// A writer over the fixture with `p` pending real memories (vectors from
+/// the corpus distribution, seeded), published. Returns the view, the
+/// writer (which owns the blocks) and the pending vectors.
+fn pending_view(n: usize, p: usize) -> (std::sync::Arc<views::View>, views::Writer, Dataset) {
+    use raggedy_anndy::real_memory::{self as real, Outbox, RealOp, REAL};
+    let f = fixture(n);
+    let centres = cluster_centres(ZONES, DIM, 1234);
+    let pend = clustered(p, DIM, &centres, SPREAD, 4242);
+    let mut w = views::writer_from(&f.index, views::DEFAULT_BLOCK_ROWS);
+    let mut buf = real::pending_for(&f.index);
+    let mut outbox = Outbox::default();
+    for i in 0..p {
+        let op = RealOp::InsertReal { id: 50_000_000 + i as u64, ts: 1, tags: 1, flags: REAL, vec: row(&pend, i).to_vec() };
+        real::apply_writer(&mut w, &mut buf, &mut outbox, &op).unwrap();
+    }
+    // Take their short-term rows out of the index (as the 1-hour expiry
+    // would) by id: an expiry by ts would take the corpus (ts 0) too.
+    for i in 0..p { views::delete(&mut w, 50_000_000 + i as u64).unwrap(); }
+    views::publish(&mut w);
+    let v = views::current(&views::latest(&w));
+    assert_eq!(views::pending_rows(&v), p);
+    (v, w, pend)
+}
+
+fn pending_gate(n: usize, k: usize, p: usize, gated: bool) {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let f = fixture(n);
+    let (v, _w, pend) = pending_view(n, p);
+    let qs = &f.timing;
+    let s = |i: usize| views::search_temporal(&v, row(qs, i), k, None, 0, 0.0);
+    // Found: each pending row is the top hit for its own vector.
+    let probe = p.min(200);
+    let found = (0..probe).filter(|&i| {
+        views::search(&v, row(&pend, i), 1).first().map(|h| h.id) == Some(50_000_000 + i as u64)
+    }).count();
+    for i in 0..WARMUP.min(qs.ids.len()) { std::hint::black_box(s(i)); }
+    let (q50, q95) = percentiles((0..qs.ids.len()).map(|i| {
+        let t0 = Instant::now();
+        std::hint::black_box(s(i));
+        t0.elapsed().as_secs_f64() * 1e6
+    }).collect());
+    let ticks = qs.ids.len() / LOOKUPS_PER_TICK;
+    let (t50, t95) = percentiles((0..ticks).map(|t| {
+        let t0 = Instant::now();
+        for j in 0..LOOKUPS_PER_TICK { std::hint::black_box(s(t * LOOKUPS_PER_TICK + j)); }
+        t0.elapsed().as_secs_f64() * 1e6
+    }).collect());
+    eprintln!("PENDING N={n} k={k} pending={p} | found {found}/{probe} | view query p50={q50:.0}us p95={q95:.0}us | tick({LOOKUPS_PER_TICK}) p50={t50:.0}us p95={t95:.0}us");
+    assert_eq!(found, probe, "N={n} pending={p}: a pending memory was not its own top hit");
+    if !gated { return; }
+    if cfg!(debug_assertions) { eprintln!("  (debug build: latency not gated; use --release)"); return; }
+    let mut fails = Vec::new();
+    if q95 > MAX_QUERY_P95_US { fails.push(format!("view query p95 {q95:.0}us > {MAX_QUERY_P95_US}us")); }
+    if t95 >= MAX_TICK_P95_US { fails.push(format!("tick p95 {t95:.0}us >= {MAX_TICK_P95_US}us")); }
+    assert!(fails.is_empty(), "N={n} k={k} pending={p}: {}", fails.join("; "));
+}
+
+#[test] fn pending_latency_n10k_k5() { pending_gate(10_000, 5, PENDING_GATE, true); }
+#[test] fn pending_latency_n10k_k10() { pending_gate(10_000, 10, PENDING_GATE, true); }
+
+#[test]
+#[ignore = "SLOW: 100k build (~20 s) + exact truth"]
+fn pending_latency_n100k_k5() { pending_gate(100_000, 5, PENDING_GATE, true); }
+
+#[test]
+#[ignore = "SLOW: 100k build (~20 s) + exact truth"]
+fn pending_latency_n100k_k10() { pending_gate(100_000, 10, PENDING_GATE, true); }
+
+#[test]
+#[ignore = "SLOW: 1M build (~2 min) + exact truth, ~3 GB RAM"]
+fn pending_latency_n1m_k5() { pending_gate(1_000_000, 5, PENDING_GATE, true); }
+
+#[test]
+#[ignore = "SLOW: 1M build (~2 min) + exact truth, ~3 GB RAM"]
+fn pending_latency_n1m_k10() { pending_gate(1_000_000, 10, PENDING_GATE, true); }
+
+/// Sizing aid, not a gate: view query latency as the pending buffer grows,
+/// for the N in RA_SWEEP_N (default 10000), k=5.
+#[test]
+#[ignore = "sizing aid: RA_SWEEP_N=1000000 cargo test --release --test gates pending_sweep -- --ignored --nocapture"]
+fn pending_sweep() {
+    let n: usize = std::env::var("RA_SWEEP_N").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+    for p in [0usize, 256, 1_024, 4_096, 16_384, 65_536] { pending_gate(n, 5, p, false); }
+}
 
 // ------------------------------------------------------------------ helpers
 

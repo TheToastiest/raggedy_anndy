@@ -32,6 +32,11 @@
 //!   For an id in both the index and the buffer, the buffer's exact score
 //!   is used (equal bits to the index's re-rank when it stores vectors).
 //!
+//! On the stage 2 writer (`apply_writer`), the writer's copy of the
+//! pending rows (`views::pending_push` / `pending_kill` / `pending_clear`)
+//! is kept in step with the buffer here, so published views search the
+//! buffer too (`views::search_temporal`).
+//!
 //! Long-term memories are not indexed here; another component reads them
 //! with SQL at query time.
 
@@ -189,6 +194,21 @@ fn rows_apply(rows: &mut Rows, op: &Op) -> Result<Applied, WriteError> {
     match rows { Rows::Index(idx, s) => live::apply(idx, s, op), Rows::Writer(w) => views::apply(w, op) }
 }
 
+/// The buffer's last row is new: give it to the writer's view side.
+fn rows_pend_push(rows: &mut Rows, buf: &Pending) {
+    let Rows::Writer(w) = rows else { return };
+    let (r, dim) = (buf.ids.len() - 1, buf.dim);
+    views::pending_push(w, buf.ids[r], buf.timestamps[r], buf.tags[r], &buf.view[r * dim..(r + 1) * dim]);
+}
+
+fn rows_pend_kill(rows: &mut Rows, id: u64) {
+    if let Rows::Writer(w) = rows { views::pending_kill(w, id); }
+}
+
+fn rows_pend_clear(rows: &mut Rows) {
+    if let Rows::Writer(w) = rows { views::pending_clear(w); }
+}
+
 /// Empty buffer with the index's metric and dim.
 pub fn pending_for(idx: &IvfPqIndex) -> Pending {
     Pending {
@@ -214,13 +234,21 @@ pub fn apply_rows(rows: &mut Rows, buf: &mut Pending, outbox: &mut Outbox, op: &
     match op {
         RealOp::Live(Op::Insert { id, .. }) if is_known(buf, *id) => Err(WriteError::DuplicateId { id: *id }.into()),
         RealOp::Live(Op::Upsert { id, ts, tags, vec }) => upsert_in(rows, buf, *id, *ts, *tags, None, vec),
-        RealOp::Live(Op::Delete { id }) => delete_in(|id| rows_delete(rows, id), buf, outbox, *id),
+        RealOp::Live(Op::Delete { id }) => {
+            let r = delete_in(|id| rows_delete(rows, id), buf, outbox, *id);
+            if let Ok(RealApplied::DeletedReal { was_pending: true, .. }) = r { rows_pend_kill(rows, *id); }
+            r
+        }
         RealOp::Live(op) => Ok(RealApplied::Live(rows_apply(rows, op)?)),
         RealOp::InsertReal { id, ts, tags, flags, vec } => {
             insert_real_in(rows, buf, *id, *ts, *tags, *flags, vec).map(|loc| RealApplied::InsertedReal { loc })
         }
         RealOp::UpsertReal { id, ts, tags, flags, vec } => upsert_in(rows, buf, *id, *ts, *tags, Some(*flags), vec),
-        RealOp::Commit => Ok(RealApplied::Committed { appended: commit(buf, outbox) }),
+        RealOp::Commit => {
+            let appended = commit(buf, outbox);
+            rows_pend_clear(rows);
+            Ok(RealApplied::Committed { appended })
+        }
         RealOp::Ack { through_seq } => ack(buf, outbox, *through_seq).map(|dropped| RealApplied::Acked { dropped }),
     }
 }
@@ -249,6 +277,7 @@ fn insert_real_in(rows: &mut Rows, buf: &mut Pending, id: u64, ts: u64, tags: u6
     // and changes nothing on error; the push below cannot fail.
     let loc = rows_insert(rows, id, ts, tags, v)?;
     push(buf, id, ts, tags, flags, v);
+    rows_pend_push(rows, buf);
     Ok(loc)
 }
 
@@ -273,8 +302,12 @@ fn upsert_in(rows: &mut Rows, buf: &mut Pending, id: u64, ts: u64, tags: u64, fl
     };
     // live::upsert does every check before any change.
     let (loc, replaced) = rows_upsert(rows, id, ts, tags, v)?;
-    if let Some(r) = row { remove_row(buf, r); }
+    if let Some(r) = row {
+        remove_row(buf, r);
+        rows_pend_kill(rows, id);
+    }
     push(buf, id, ts, tags, new_flags, v);
+    rows_pend_push(rows, buf);
     Ok(RealApplied::UpsertedReal { loc, replaced, flags: new_flags })
 }
 
@@ -389,6 +422,20 @@ fn clear(buf: &mut Pending) {
 }
 
 pub fn pending_len(buf: &Pending) -> usize { buf.ids.len() }
+
+/// Room for `rows` more pending rows, so inserts and upserts of real ids
+/// do not allocate until then (the commit keeps the room). Pair it with
+/// `views::reserve_pending` on the writer.
+pub fn reserve(buf: &mut Pending, rows: usize) {
+    let n = rows * buf.dim;
+    buf.ids.reserve(rows);
+    buf.timestamps.reserve(rows);
+    buf.tags.reserve(rows);
+    buf.flags.reserve(rows);
+    buf.raw.reserve(n);
+    buf.view.reserve(n);
+    buf.dir.reserve(rows);
+}
 
 pub fn is_pending(buf: &Pending, id: u64) -> bool { buf.dir.contains_key(&id) }
 

@@ -173,3 +173,65 @@ fn writer_publish_does_not_allocate_after_reserve() {
         assert_eq!(views::arena_stats(&w).grown, 0);
     }
 }
+
+/// Real-memory writes on the writer thread (insert, upsert and delete of a
+/// pending id) and the publish that shows them to queries do not allocate
+/// once `real_memory::reserve` and `views::reserve_pending` have made room.
+/// The commit is a 12-hour op that builds outbox records, so it may
+/// allocate; the publish after it may not.
+#[test]
+fn real_memory_writes_and_publish_do_not_allocate_after_reserve() {
+    use raggedy_anndy::real_memory::{self as real, RealOp, REAL};
+    use raggedy_anndy::system;
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dim = 32;
+    let ds = uniform_sphere(2000, dim, 1);
+    let rows: Vec<(u64, Vec<f32>, u64)> = (0..2000).map(|i| (ds.ids[i], row(&ds, i).to_vec(), i as u64)).collect();
+    for (metric, block_rows) in [(Metric::Cosine, 16usize), (Metric::L2, views::DEFAULT_BLOCK_ROWS)] {
+        let idx = IvfPqIndex::build(metric, dim, &rows, ivfpq_params(16, 4, 64, 8, 7));
+        let mut sys = system::start(&idx, block_rows);
+        let pool = views::DEFAULT_VIEWS;
+        views::reserve(&mut sys.w, 600, pool);
+        views::reserve_pending(&mut sys.w, 600);
+        real::reserve(&mut sys.st.buf, 600);
+        let latest = views::latest(&sys.w);
+        let mut rng = SplitMix64::new(4);
+        let vs: Vec<Vec<f32>> = (0..300).map(|_| {
+            let mut v: Vec<f32> = (0..dim).map(|_| gauss(&mut rng)).collect(); normalize(&mut v); v
+        }).collect();
+        let ins: Vec<RealOp> = (0..200).map(|i| RealOp::InsertReal { id: 200_000 + i as u64, ts: 5_000, tags: 1, flags: REAL, vec: vs[i].clone() }).collect();
+        let ups: Vec<RealOp> = (0..50).map(|i| RealOp::Live(Op::Upsert { id: 200_000 + i as u64, ts: 5_001, tags: 2, vec: vs[200 + i].clone() })).collect();
+        let dels: Vec<RealOp> = (50..100).map(|i| RealOp::Live(Op::Delete { id: 200_000 + i as u64 })).collect();
+        // Warm-up as in `writer_publish_does_not_allocate_after_reserve`.
+        drop(views::current(&latest));
+        views::publish(&mut sys.w);
+        views::reserve(&mut sys.w, 600, pool);
+        views::reserve_pending(&mut sys.w, 600);
+
+        ARMED.store(true, Ordering::SeqCst);
+        for chunk in ins.chunks(20) {
+            for op in chunk { system::write(&mut sys, op).unwrap(); }
+            assert_eq!(views::publish(&mut sys.w).deferred, 0);
+        }
+        for op in ups.iter().chain(&dels) { system::write(&mut sys, op).unwrap(); }
+        views::publish(&mut sys.w);
+        ARMED.store(false, Ordering::SeqCst);
+        let n = ALLOCS.swap(0, Ordering::SeqCst);
+        assert_eq!(n, 0, "{metric:?} block_rows={block_rows}: {n} allocations in real-memory ticks");
+        assert_eq!(views::pending_rows(&views::current(&latest)), 150);
+
+        system::write(&mut sys, &RealOp::Commit).unwrap();
+        views::publish(&mut sys.w);
+        // Every view has seen the commit once the pool has cycled.
+        for _ in 0..pool { views::publish(&mut sys.w); }
+        let again: Vec<RealOp> = (0..40).map(|i| RealOp::InsertReal { id: 300_000 + i as u64, ts: 5_010, tags: 1, flags: REAL, vec: vs[i].clone() }).collect();
+        ARMED.store(true, Ordering::SeqCst);
+        for op in &again { system::write(&mut sys, op).unwrap(); }
+        views::publish(&mut sys.w);
+        ARMED.store(false, Ordering::SeqCst);
+        let n = ALLOCS.swap(0, Ordering::SeqCst);
+        assert_eq!(n, 0, "{metric:?} block_rows={block_rows}: {n} allocations after commit");
+        assert_eq!(views::pending_rows(&views::current(&latest)), 40);
+        assert_eq!(views::arena_stats(&sys.w).grown, 0);
+    }
+}
