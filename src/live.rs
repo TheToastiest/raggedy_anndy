@@ -137,20 +137,35 @@ pub(crate) fn encode_row(model: &IvfPqIndex, s: &mut Scratch, v: &[f32]) -> usiz
 
 /// Writes the row; all checks already passed.
 fn append(idx: &mut IvfPqIndex, s: &mut Scratch, id: u64, ts: u64, tags: u64, v: &[f32]) -> RowLoc {
-    let dim = idx.dim;
     let li = encode_row(idx, s, v);
+    push_row(idx, id, ts, tags, li, &s.codes, &s.view)
+}
 
+/// Append an encoded row to list `li`: `codes` and `view` (the stored,
+/// normalised vector) as `encode_row` left them. All checks already passed.
+fn push_row(idx: &mut IvfPqIndex, id: u64, ts: u64, tags: u64, li: usize, codes: &[u8], view: &[f32]) -> RowLoc {
+    let dim = idx.dim;
     let list = &mut idx.lists[li];
     let loc = RowLoc { list: li as u32, row: list.ids.len() as u32 };
     list.ids.push(id);
     list.timestamps.push(ts);
     list.tomb.push(0);
     list.tags.push(tags);
-    list.codes.extend_from_slice(&s.codes);
-    if let Some(vecs) = &mut list.vecs { vecs.extend_from_slice(&s.view[..dim]); }
+    list.codes.extend_from_slice(codes);
+    if let Some(vecs) = &mut list.vecs { vecs.extend_from_slice(&view[..dim]); }
     idx.dir.insert(id, loc);
     idx.max_ts = ts;
     loc
+}
+
+/// `insert` of a row already encoded with `idx`'s model (`encode_row` on
+/// `raw`, done elsewhere, e.g. on another thread): the same checks on
+/// `raw`, the same row. Lets a bulk insert encode in parallel and append
+/// in order.
+pub(crate) fn insert_encoded(idx: &mut IvfPqIndex, id: u64, ts: u64, tags: u64, raw: &[f32], li: usize, codes: &[u8], view: &[f32]) -> Result<RowLoc, WriteError> {
+    check_row(idx.dim, idx.max_ts, id, ts, raw)?;
+    if idx.dir.contains_key(&id) { return Err(WriteError::DuplicateId { id }); }
+    Ok(push_row(idx, id, ts, tags, li, codes, view))
 }
 
 /// Mark `id` dead. O(1).

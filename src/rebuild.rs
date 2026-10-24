@@ -85,6 +85,11 @@ pub enum RebuildError {
     GateDecision { accept: bool },
     /// The gate recomputed on replay differs from the logged one.
     GateMismatch { seq: u64 },
+    /// Carried ops from position `at` handed to a preparation that has
+    /// applied `carried` (or asked of a carry that holds `carried`).
+    CarryGap { at: usize, carried: usize },
+    /// A preparation built with `got` rows per block for a writer with `want`.
+    BlockRows { got: usize, want: usize },
 }
 
 impl std::fmt::Display for RebuildError {
