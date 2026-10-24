@@ -465,11 +465,14 @@ fn search_pending(buf: &Pending, q_eff: &[f32], required_tag: Option<u64>, curre
 
 /// Top-k over the short-term index and the pending buffer together, by
 /// (score desc, id asc), each id at most once. Arguments as
-/// `IvfPqIndex::search_temporal`. The index is asked for `k + pending`
-/// hits, so dropping ids that are also pending still leaves k from it.
+/// `IvfPqIndex::search_temporal`. The index is asked for k plus the number
+/// of pending ids it still holds, so dropping those still leaves k from it.
+/// O(pending) lookups for that count; `views::search_temporal` keeps it
+/// on the writer instead.
 pub fn search(idx: &IvfPqIndex, buf: &Pending, q: &[f32], k: usize, required_tag: Option<u64>, current_time: u64, lambda: f32) -> Vec<Hit> {
     if k == 0 || q.iter().any(|x| !x.is_finite()) { return Vec::new(); }
-    let mut hits = idx.search_temporal(q, k + buf.ids.len(), required_tag, current_time, lambda);
+    let in_index = buf.ids.iter().filter(|id| idx.dir.contains_key(id)).count();
+    let mut hits = idx.search_temporal(q, k + in_index, required_tag, current_time, lambda);
     hits.retain(|h| !buf.dir.contains_key(&h.id));
     if !buf.ids.is_empty() {
         let mut q_eff = q.to_vec();

@@ -116,6 +116,8 @@ pub struct View {
     pub pending: ListMeta,
     /// Ids of the live rows of `pending`, ascending.
     pub pending_ids: Vec<u64>,
+    /// How many of `pending_ids` also have a live row in this view's lists.
+    pub pending_in_lists: usize,
 }
 
 /// Where query threads get the newest view (`current`).
@@ -159,6 +161,8 @@ pub struct Writer {
     pend_rows: Vec<u32>,
     /// Seq of the tick that last changed `pend`.
     pend_touched: u64,
+    /// How many pending ids are also in `dir` (live in the lists).
+    pend_in_dir: usize,
     /// Blocks of `pend`: no codes, a vector of `dim` floats.
     ppool: Pool,
     /// Seq of the view in `latest`.
@@ -262,7 +266,7 @@ fn new_view(w_lists: &[ListMeta], pend: &ListMeta, pend_ids: &[u64], seq: u64, m
     fit(&mut pending, pend);
     let mut ids = Vec::with_capacity(pend_ids.len().max(pend.tomb.capacity()));
     ids.extend_from_slice(pend_ids);
-    Arc::new(View { seq, max_ts, block_rows, model: model.clone(), lists, pending, pending_ids: ids })
+    Arc::new(View { seq, max_ts, block_rows, model: model.clone(), lists, pending, pending_ids: ids, pending_in_lists: 0 })
 }
 
 fn take_block(p: &mut Pool) -> Arc<Block> {
@@ -336,9 +340,14 @@ pub fn writer_with_pending(idx: &IvfPqIndex, block_rows: usize, ids: &[u64], ts:
     pend_dir.sort_unstable();
     let pend_ids: Vec<u64> = pend_dir.iter().map(|p| p.0).collect();
     let pend_rows: Vec<u32> = pend_dir.iter().map(|p| p.1).collect();
-    let views: Vec<Arc<View>> = (0..DEFAULT_VIEWS).map(|_| new_view(&lists, &pend, &pend_ids, 0, idx.max_ts, block_rows, &model)).collect();
+    let pend_in_dir = pend_ids.iter().filter(|id| idx.dir.contains_key(id)).count();
+    let views: Vec<Arc<View>> = (0..DEFAULT_VIEWS).map(|_| {
+        let mut v = new_view(&lists, &pend, &pend_ids, 0, idx.max_ts, block_rows, &model);
+        Arc::get_mut(&mut v).expect("new view").pending_in_lists = pend_in_dir;
+        v
+    }).collect();
     Writer {
-        pend, pend_ids, pend_rows, pend_touched: 0, ppool,
+        pend, pend_ids, pend_rows, pend_touched: 0, pend_in_dir, ppool,
         scratch: live::scratch_for(&model),
         touched: vec![0; lists.len()],
         dead_since: lists.iter().map(|l| if l.dead > 0 { 0 } else { NEVER }).collect(),
@@ -385,6 +394,7 @@ fn append(w: &mut Writer, id: u64, ts: u64, tags: u64, v: &[f32]) -> RowLoc {
     let row = push_row(&mut w.pool, &mut w.lists[li], id, ts, tags, &w.scratch.codes, vec);
     let loc = RowLoc { list: li as u32, row: row as u32 };
     w.dir.insert(id, loc);
+    if w.pend_ids.binary_search(&id).is_ok() { w.pend_in_dir += 1; }
     w.max_ts = ts;
     w.touched[li] = w.seq;
     loc
@@ -399,6 +409,7 @@ fn kill(l: &mut ListMeta, dead_since: &mut u64, seq: u64) {
 /// Mark `id` dead. O(1).
 pub fn delete(w: &mut Writer, id: u64) -> Result<RowLoc, WriteError> {
     let loc = w.dir.remove(&id).ok_or(WriteError::NotFound { id })?;
+    if w.pend_ids.binary_search(&id).is_ok() { w.pend_in_dir -= 1; }
     let li = loc.list as usize;
     let l = &mut w.lists[li];
     l.tomb[loc.row as usize] = 1;
@@ -429,6 +440,7 @@ pub fn expire(w: &mut Writer, before_ts: u64, max_rows: usize) -> (Vec<u64>, boo
                 kill(l, &mut w.dead_since[li], w.seq);
                 let id = l.blocks[r / cap].id(r % cap);
                 w.dir.remove(&id);
+                if w.pend_ids.binary_search(&id).is_ok() { w.pend_in_dir -= 1; }
                 ids.push(id);
             }
             l.head += 1;
@@ -490,7 +502,9 @@ pub fn reserve(w: &mut Writer, rows_per_list: usize, views: usize) {
     w.views.reserve(views.saturating_sub(w.views.len()));
     w.dirty.reserve(views.saturating_sub(w.dirty.len()));
     while w.views.len() < views {
-        w.views.push(new_view(&w.lists, &w.pend, &w.pend_ids, w.seq - 1, w.max_ts, cap, &w.model));
+        let mut v = new_view(&w.lists, &w.pend, &w.pend_ids, w.seq - 1, w.max_ts, cap, &w.model);
+        Arc::get_mut(&mut v).expect("new view").pending_in_lists = w.pend_in_dir;
+        w.views.push(v);
         w.dirty.push(false);
     }
     fit_views(w);
@@ -534,6 +548,7 @@ pub fn pending_push(w: &mut Writer, id: u64, ts: u64, tags: u64, v: &[f32]) {
     let r = push_row(&mut w.ppool, &mut w.pend, id, ts, tags, &[], v);
     w.pend_ids.insert(at, id);
     w.pend_rows.insert(at, r as u32);
+    if w.dir.contains_key(&id) { w.pend_in_dir += 1; }
     w.pend_touched = w.seq;
 }
 
@@ -544,6 +559,7 @@ pub fn pending_kill(w: &mut Writer, id: u64) -> bool {
     let r = w.pend_rows[at] as usize;
     w.pend_ids.remove(at);
     w.pend_rows.remove(at);
+    if w.dir.contains_key(&id) { w.pend_in_dir -= 1; }
     w.pend.tomb[r] = 1;
     w.pend.dead += 1;
     w.pend_touched = w.seq;
@@ -561,6 +577,7 @@ pub fn pending_clear(w: &mut Writer) {
     w.pend.dead = 0;
     w.pend_ids.clear();
     w.pend_rows.clear();
+    w.pend_in_dir = 0;
     w.dirty.iter_mut().for_each(|d| *d = true);
     w.pend_touched = w.seq;
 }
@@ -634,6 +651,7 @@ pub fn publish(w: &mut Writer) -> Published {
         copy_meta(&mut dst.pending, &w.pend);
         dst.pending_ids.clone_from(&w.pend_ids);
     }
+    dst.pending_in_lists = w.pend_in_dir;
     dst.seq = seq;
     dst.max_ts = w.max_ts;
     // The old view stays in `views`: never the last handle, so `store` frees nothing.
@@ -725,6 +743,7 @@ pub fn rebase(w: &mut Writer, idx: &IvfPqIndex) {
     std::mem::swap(&mut n.pend_rows, &mut w.pend_rows);
     std::mem::swap(&mut n.ppool, &mut w.ppool);
     n.pend_touched = n.seq;
+    n.pend_in_dir = n.pend_ids.iter().filter(|id| n.dir.contains_key(id)).count();
     fit_views(&mut n);
     *w = n;
 }
@@ -745,11 +764,11 @@ impl ListRows for View {
 /// on (`to_index(v)`, the buffer at `v.seq`), bit for bit. With no pending
 /// rows, exactly `IvfPqIndex::search_temporal` on `to_index(v)`.
 pub fn search_temporal(v: &View, q: &[f32], k: usize, required_tag: Option<u64>, current_time: u64, lambda: f32) -> Vec<Hit> {
-    let p = v.pending_ids.len();
-    if p == 0 { return search_rows(&v.model, v, q, k, required_tag, current_time, lambda); }
+    if v.pending_ids.is_empty() { return search_rows(&v.model, v, q, k, required_tag, current_time, lambda); }
     if k == 0 || q.iter().any(|x| !x.is_finite()) { return Vec::new(); }
-    // k + p from the index, so dropping the pending ids still leaves k.
-    let mut hits = search_rows(&v.model, v, q, k + p, required_tag, current_time, lambda);
+    // k + (pending ids still in the lists) from the index, so dropping
+    // them still leaves k. Pending rows past the 1-hour expiry cost nothing.
+    let mut hits = search_rows(&v.model, v, q, k + v.pending_in_lists, required_tag, current_time, lambda);
     hits.retain(|h| v.pending_ids.binary_search(&h.id).is_err());
     let mut q_eff = q.to_vec();
     if matches!(v.model.metric, Metric::Cosine) { norm_inplace(&mut q_eff); }
