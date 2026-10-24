@@ -274,6 +274,14 @@ pub fn swap(w: &mut LogWriter, sys: &mut System, r: Rebuilt, gate: Gate) -> Resu
     Ok(e)
 }
 
+/// `system::swap_prepared`, and log the `SwapModel` entry. Nothing is
+/// logged if it is refused.
+pub fn swap_prepared(w: &mut LogWriter, sys: &mut System, p: system::Prepared, gate: Gate) -> Result<(LogOp, views::Retired), system::SwapRefused> {
+    let (e, retired) = system::swap_prepared(sys, p, gate)?;
+    log_model(w, sys, &e);
+    Ok((e, retired))
+}
+
 /// `system::reject`, and log the `RejectModel` entry.
 pub fn reject(w: &mut LogWriter, sys: &mut System, r: &Rebuilt, gate: Gate) -> Result<LogOp, RebuildError> {
     let e = system::reject(sys, r, gate)?;

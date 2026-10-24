@@ -94,7 +94,7 @@ pub struct Signals {
 }
 
 /// (||r - decode(code)||², ||r||²) for one encoded row, in f64.
-fn row_err(pq: &ProductQuantizer, r: &[f32], code: &[u8]) -> (f64, f64) {
+pub(crate) fn row_err(pq: &ProductQuantizer, r: &[f32], code: &[u8]) -> (f64, f64) {
     let dsub = pq.dsub;
     let (mut e, mut n) = (0.0f64, 0.0f64);
     for (j, &c) in code.iter().enumerate() {
@@ -150,11 +150,17 @@ pub fn record(st: &mut DriftStats, idx: &IvfPqIndex, s: &Scratch, result: &Resul
     if let Some(loc) = loc {
         let (r, code) = live::last_encoded(idx, s);
         let (e, n) = row_err(&idx.pq, r, code);
-        let li = loc.list as usize;
-        st.qerr[li] += e;
-        st.rnorm[li] += n;
-        st.inserts[li] += 1;
+        record_row(st, loc.list as usize, e, n);
     }
+}
+
+/// One inserted row in list `li` with `row_err` (`e`, `n`): what `record`
+/// adds for an insert. Rows must be recorded in op order (f64 sums).
+#[inline]
+pub(crate) fn record_row(st: &mut DriftStats, li: usize, e: f64, n: f64) {
+    st.qerr[li] += e;
+    st.rnorm[li] += n;
+    st.inserts[li] += 1;
 }
 
 /// Current drift signals. O(nlist).

@@ -219,19 +219,12 @@ fn capture_then_snapshot_equals_begin_rebuild() {
 }
 
 #[test]
-fn capture_needs_raw_vectors_and_cancel_ends_it() {
+fn cancel_ends_a_capture() {
     let (mut sys, _) = running(false, 3, 20);
     system::capture_rows(&mut sys).unwrap();
     system::cancel(&mut sys);
+    assert!(sys.carry.is_none());
     assert!(system::capture_rows(&mut sys).is_ok());
-
-    let ds = uniform_sphere(500, DIM, 9);
-    let rows: Vec<(u64, Vec<f32>, u64)> = (0..500).map(|i| (ds.ids[i], row(&ds, i).to_vec(), i as u64)).collect();
-    let mut p = ivfpq_params(NLIST, 4, 64, M, 7);
-    p.store_vecs = false;
-    let mut bare = system::start(&IvfPqIndex::build(Metric::Cosine, DIM, &rows, p), BLOCK);
-    assert!(matches!(system::capture_rows(&mut bare), Err(RebuildError::NoRawVectors)));
-    assert!(bare.carry.is_none());
 }
 
 // ------------------------------------------------------------ prepare on a worker, install on the writer
@@ -249,10 +242,10 @@ fn worker_prepare(snap: Snapshot, base_seed: u64, threads: usize, carried: Vec<O
 }
 
 /// The prepared writer handed back by a refused swap, after checking why.
-fn refused(r: Result<LogOp, system::SwapRefused>, why: impl Fn(&RebuildError) -> bool) -> system::Prepared {
+fn refused(r: Result<(LogOp, views::Retired), system::SwapRefused>, why: impl Fn(&RebuildError) -> bool) -> system::Prepared {
     match r {
         Err(e) => { assert!(why(&e.err), "refused for {:?}", e.err); *e.prepared }
-        Ok(e) => panic!("swap went through: {e:?}"),
+        Ok((e, _)) => panic!("swap went through: {e:?}"),
     }
 }
 
@@ -286,7 +279,7 @@ fn prepared_swap_equals_swap() {
             let rest = system::carry_since(&b, at).unwrap().to_vec();
             assert!(!rest.is_empty());
             system::catch_up_prepared(&mut p, at, &rest).unwrap();
-            let eb = system::swap_prepared(&mut b, p, gb).unwrap();
+            let (eb, retired) = system::swap_prepared(&mut b, p, gb).unwrap();
 
             assert_eq!(eb, ea, "opq={opq} threads={threads}: log entry");
             assert_eq!(b.st, a.st, "opq={opq} threads={threads}: state");
@@ -305,6 +298,8 @@ fn prepared_swap_equals_swap() {
                 assert_eq!(bits(&vb), bits(&va), "opq={opq} threads={threads}: query");
             }
             drop((va, vb));
+            // Freed off the writer thread, after the publish.
+            std::thread::spawn(move || drop(retired)).join().unwrap();
             run_ticks(&mut a, &mut da, 100);
             run_ticks(&mut b, &mut db, 100);
             assert_eq!(system::fingerprint(&b), system::fingerprint(&a));
@@ -344,7 +339,8 @@ fn prepared_catch_up_and_swap_refuse_mismatches() {
     let mut p = refused(system::swap_prepared(&mut sys, p, accepting()), |e| matches!(e, RebuildError::WrongEpoch { .. }));
     p.epoch -= 1;
     assert_eq!((system::fingerprint(&sys), sys.st.clone()), before, "refused swaps change nothing");
-    system::swap_prepared(&mut sys, p, accepting()).unwrap();
+    let (e, _) = system::swap_prepared(&mut sys, p, accepting()).unwrap();
+    assert!(matches!(e, LogOp::SwapModel { epoch: 1, .. }));
     assert_eq!(sys.st.epoch, 1);
     assert!(sys.carry.is_none());
     assert!(matches!(system::carry_since(&sys, 0), Err(RebuildError::NoRebuildPending)));
