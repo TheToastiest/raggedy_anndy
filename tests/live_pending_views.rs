@@ -15,6 +15,9 @@
 //! - each id comes back at most once, a pending id with its exact score;
 //! - a snapshot load (`system::from_parts`) and a model swap
 //!   (`views::rebase`) keep the buffer searchable from the first view on;
+//! - so does a rebuild swapped in off the writer thread
+//!   (`system::capture_rows` / `prepare` / `swap_prepared`), with real
+//!   memories written while the rebuild was in flight;
 //! - the same log gives the same results on a second run.
 //!
 //! No-allocation of real-memory writes and publish is checked in
@@ -25,7 +28,10 @@ use common::*;
 
 use std::collections::BTreeSet;
 
+use raggedy_anndy::drift::Signals;
+use raggedy_anndy::gate::{self, GameCheck, Gate, GateReason};
 use raggedy_anndy::live::Op;
+use raggedy_anndy::rebuild;
 use raggedy_anndy::real_memory::{self as real, Pending, RealOp, LEGENDARY, REAL};
 use raggedy_anndy::seed::SplitMix64;
 use raggedy_anndy::system::{self, System};
@@ -325,6 +331,73 @@ fn snapshot_load_and_model_swap_keep_pending_searchable() {
     views::publish(&mut sys.w);
     assert_eq!(views::pending_rows(&now_view(&sys)), 0);
     assert_view_matches(&now_view(&sys), &sys.st.buf, &qs, "after rebase + commit");
+}
+
+/// A gate that accepts; the gate's measurements play no part in a swap.
+fn accepting() -> Gate {
+    let s = Signals { qerr_ratio: 0.0, rnorm_ratio: 0.0, imbalance: 0.0, churn: 0.0, inserts: 0, fired: 0 };
+    Gate {
+        params: gate::default_gate_params(), game: GameCheck::NotRun, queries: 0, trials: 0, current_hits: 0, candidate_hits: 0,
+        current: s, candidate: s, accept: true, reason: GateReason::RecallGain,
+    }
+}
+
+#[test]
+fn prepared_swap_keeps_pending_searchable() {
+    for metric in [Metric::Cosine, Metric::L2] {
+        let idx = base_index(metric, 1_500, 41);
+        let mut sys = system::start(&idx, BLOCK);
+        let mut rng = SplitMix64::new(42);
+        let qs: Vec<Vec<f32>> = (0..4).map(|_| random_unit(&mut rng)).collect();
+        run_churn(&mut sys, &churn(43, 20, 10, 1_500), &qs, false);
+
+        // Pending before the capture, and more written while the rebuild is in flight.
+        let mut pend = Vec::new();
+        let mut put = |sys: &mut System, rng: &mut SplitMix64, id: u64| {
+            let v = random_unit(rng);
+            let ts = sys.w.max_ts + 1;
+            write(sys, RealOp::InsertReal { id, ts, tags: 0, flags: REAL, vec: v.clone() });
+            pend.push((id, v));
+        };
+        for i in 0..4u64 { put(&mut sys, &mut rng, 6_000_000 + i); }
+        views::publish(&mut sys.w);
+
+        let cap = system::capture_rows(&mut sys).expect("capture");
+        let snap = std::thread::spawn(move || system::snapshot_of(&cap)).join().unwrap();
+        for i in 4..8u64 { put(&mut sys, &mut rng, 6_000_000 + i); }
+        // Expire every short-term row: the pending ones are found from the buffer alone.
+        let before_ts = sys.w.max_ts + 1;
+        write(&mut sys, RealOp::Live(Op::Expire { before_ts, max_rows: usize::MAX }));
+        views::publish(&mut sys.w);
+
+        let (base_seed, block) = (sys.st.base_seed, views::block_rows(&sys.w));
+        let carried = system::carry_since(&sys, 0).unwrap().to_vec();
+        let p = std::thread::spawn(move || {
+            let r = rebuild::rebuild(&snap, base_seed, 2).unwrap();
+            let mut p = system::prepare(r, block);
+            system::catch_up_prepared(&mut p, 0, &carried).unwrap();
+            p
+        }).join().unwrap();
+        let (_, retired) = system::swap_prepared(&mut sys, p, accepting()).expect("swap_prepared");
+        views::publish(&mut sys.w);
+        std::thread::spawn(move || drop(retired)).join().unwrap();
+        if let Err(e) = system::check_invariants(&sys) { panic!("{metric:?}: invariant broken: {e}"); }
+
+        let sv = now_view(&sys);
+        assert_eq!(views::pending_rows(&sv), real::pending_len(&sys.st.buf), "{metric:?}");
+        assert!(real::pending_len(&sys.st.buf) >= pend.len());
+        assert_view_matches(&sv, &sys.st.buf, &qs, "after swap_prepared");
+        for (id, v) in &pend { assert_eq!(top1(&sv, v), Some(*id), "{metric:?}: pending {id} after swap_prepared"); }
+
+        // Writes after the swap still reach the buffer's view side.
+        write(&mut sys, RealOp::Live(Op::Delete { id: 6_000_000 }));
+        views::publish(&mut sys.w);
+        assert_view_matches(&now_view(&sys), &sys.st.buf, &qs, "after swap_prepared + delete");
+        write(&mut sys, RealOp::Commit);
+        views::publish(&mut sys.w);
+        assert_eq!(views::pending_rows(&now_view(&sys)), 0);
+        assert_view_matches(&now_view(&sys), &sys.st.buf, &qs, "after swap_prepared + commit");
+    }
 }
 
 #[test]
