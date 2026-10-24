@@ -25,7 +25,7 @@
 use crate::drift::{self, DriftBaseline, Signals, Thresholds, IMBALANCE, QERR, RNORM};
 use crate::flat::FlatIndex;
 use crate::ivfpq::IvfPqIndex;
-use crate::live::{self, Op};
+use crate::live;
 use crate::par;
 use crate::types::Hit;
 use crate::rebuild::{RebuildError, Rebuilt, Snapshot};
@@ -112,35 +112,83 @@ pub fn decide(p: &GateParams, game: GameCheck, trials: u32, current_hits: u32, c
     (false, GateReason::NoGain)
 }
 
-/// Insert `rows` (indexes into the snapshot, in (ts, id) order) into an
-/// empty copy of `model`; the result and its drift stats.
-fn reencode(model: &IvfPqIndex, snap: &Snapshot, rows: &[usize]) -> (IvfPqIndex, drift::DriftStats) {
-    let dim = snap.dim;
-    let mut idx = live::empty_like(model);
-    let mut s = live::scratch_for(&idx);
-    let mut stats = drift::new_stats(&idx);
+/// Rows encoded per round of `reencode`: bounds the encoded buffers
+/// (rows x (dim floats + m bytes)) while keeping every thread busy.
+const ENCODE_CHUNK: usize = 1 << 14;
+
+/// One thread's share of a round, encoded with the model, as columns.
+struct EncodedRows {
+    list: Vec<u32>,
+    codes: Vec<u8>,
+    /// Stored (normalised) vectors, `dim` per row.
+    view: Vec<f32>,
+    /// `drift::row_err` of each row.
+    qerr: Vec<f64>,
+    rnorm: Vec<f64>,
+}
+
+/// Encode snapshot rows `rows` with `model`, as `live::apply` would.
+/// Pure per row, so it can run on any thread.
+fn encode_rows(model: &IvfPqIndex, snap: &Snapshot, rows: &[usize]) -> EncodedRows {
+    let (dim, m, n) = (snap.dim, model.params.m, rows.len());
+    let mut s = live::scratch_for(model);
+    let mut out = EncodedRows {
+        list: Vec::with_capacity(n), codes: Vec::with_capacity(n * m), view: Vec::with_capacity(n * dim),
+        qerr: Vec::with_capacity(n), rnorm: Vec::with_capacity(n),
+    };
     for &i in rows {
-        let op = Op::Insert { id: snap.ids[i], ts: snap.ts[i], tags: snap.tags[i], vec: snap.vecs[i * dim..(i + 1) * dim].to_vec() };
-        let r = live::apply(&mut idx, &mut s, &op);
-        assert!(r.is_ok(), "gate re-encode refused {op:?}: {r:?}");
-        drift::record(&mut stats, &idx, &s, &r);
+        let li = live::encode_row(model, &mut s, &snap.vecs[i * dim..(i + 1) * dim]);
+        let (r, code) = live::last_encoded(model, &s);
+        let (e, nrm) = drift::row_err(&model.pq, r, code);
+        out.list.push(li as u32);
+        out.codes.extend_from_slice(code);
+        out.view.extend_from_slice(&s.view);
+        out.qerr.push(e);
+        out.rnorm.push(nrm);
+    }
+    out
+}
+
+/// Insert `rows` (indexes into the snapshot, in (ts, id) order) into an
+/// empty copy of `model`; the result and its drift stats. Rows are encoded
+/// on `threads` threads, a round of `ENCODE_CHUNK` at a time, then
+/// appended and recorded in `rows` order, so the index and the stats are
+/// those of `live::apply` + `drift::record` row by row, for any `threads`.
+fn reencode(model: &IvfPqIndex, snap: &Snapshot, rows: &[usize], threads: usize) -> (IvfPqIndex, drift::DriftStats) {
+    let (dim, m) = (snap.dim, model.params.m);
+    let threads = threads.max(1);
+    let mut idx = live::empty_like(model);
+    let mut stats = drift::new_stats(&idx);
+    for round in rows.chunks(ENCODE_CHUNK) {
+        let parts: Vec<&[usize]> = round.chunks(round.len().div_ceil(threads)).collect();
+        let encoded = par::parallel_map_indexed(&parts, threads, |part, _| encode_rows(model, snap, part));
+        for (part, e) in parts.iter().zip(&encoded) {
+            for (j, &i) in part.iter().enumerate() {
+                let li = e.list[j] as usize;
+                let raw = &snap.vecs[i * dim..(i + 1) * dim];
+                let r = live::insert_encoded(&mut idx, snap.ids[i], snap.ts[i], snap.tags[i], raw, li, &e.codes[j * m..(j + 1) * m], &e.view[j * dim..(j + 1) * dim]);
+                assert!(r.is_ok(), "gate re-encode refused id {}: {r:?}", snap.ids[i]);
+                drift::record_row(&mut stats, li, e.qerr[j], e.rnorm[j]);
+            }
+        }
     }
     (idx, stats)
 }
 
 /// Drift of `model` on `recent`, judged against `baseline`; imbalance from
 /// `full` (the model holding every snapshot row).
-fn model_signals(model: &IvfPqIndex, baseline: &DriftBaseline, full: &IvfPqIndex, snap: &Snapshot, recent: &[usize], th: &Thresholds) -> Signals {
-    let (_, stats) = reencode(model, snap, recent);
+fn model_signals(model: &IvfPqIndex, baseline: &DriftBaseline, full: &IvfPqIndex, snap: &Snapshot, recent: &[usize], th: &Thresholds, threads: usize) -> Signals {
+    let (_, stats) = reencode(model, snap, recent, threads);
     let mut sig = drift::check(&stats, baseline, full, th);
     sig.fired &= MODEL_SIGNALS;
     sig
 }
 
 /// Run the gate for `cand`, rebuilt from `snap` and not yet caught up.
-/// Worker side; O(snapshot rows) encodes (serial) plus `queries` exact
-/// scans spread over `threads`. Per-query counts are summed in query order,
-/// so the result is the same for every `threads` value.
+/// Worker side; O(snapshot rows) encodes and `queries` exact scans, both
+/// spread over `threads`. Encoded rows are appended and per-query counts
+/// summed in a fixed order, so the result is the same for every `threads`
+/// value.
 pub fn evaluate(snap: &Snapshot, cand: &Rebuilt, p: &GateParams, game: GameCheck, threads: usize) -> Result<Gate, RebuildError> {
     if cand.snapshot_seq != snap.seq { return Err(RebuildError::WrongSnapshot { got: cand.snapshot_seq, want: snap.seq }); }
     if cand.carried != 0 { return Err(RebuildError::GateAfterCatchUp { carried: cand.carried }); }
@@ -160,7 +208,7 @@ pub fn evaluate(snap: &Snapshot, cand: &Rebuilt, p: &GateParams, game: GameCheck
     }
     pool.truncate(q);
 
-    let (current, _) = reencode(&snap.model, snap, &order);
+    let (current, _) = reencode(&snap.model, snap, &order, threads);
     let cidx = &cand.next.idx;
     let mut flat = FlatIndex::new(dim, snap.metric);
     for i in 0..n { flat.add(snap.ids[i], &snap.vecs[i * dim..(i + 1) * dim]); }
@@ -173,8 +221,8 @@ pub fn evaluate(snap: &Snapshot, cand: &Rebuilt, p: &GateParams, game: GameCheck
     let (mut trials, mut current_hits, mut candidate_hits) = (0u32, 0u32, 0u32);
     for (t, c, n) in per_query { trials += t; current_hits += c; candidate_hits += n; }
 
-    let cur_sig = model_signals(&snap.model, &snap.baseline, &current, snap, recent, &p.th);
-    let cand_sig = model_signals(cidx, &cand.next.baseline, cidx, snap, recent, &p.th);
+    let cur_sig = model_signals(&snap.model, &snap.baseline, &current, snap, recent, &p.th, threads);
+    let cand_sig = model_signals(cidx, &cand.next.baseline, cidx, snap, recent, &p.th, threads);
     let (accept, reason) = decide(p, game, trials, current_hits, candidate_hits, cur_sig.fired, cand_sig.fired);
     Ok(Gate {
         params: *p, game, queries: q as u32, trials, current_hits, candidate_hits,
